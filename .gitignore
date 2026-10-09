@@ -1,0 +1,8 @@
+/target/
+/.embuild/
+/sdkconfig
+/sdkconfig.old
+/sdkconfig.*.old
+/export-esp.sh
+.env
+.env.*
