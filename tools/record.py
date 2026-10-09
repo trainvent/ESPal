@@ -63,7 +63,8 @@ def main():
     port.rts = False
     port.open()
     try:
-        time.sleep(0.7)
+        # PSRAM's boot memory test takes roughly one second on the Nano.
+        time.sleep(1.5)
         port.reset_input_buffer()
         input("Press Enter, then speak immediately for 5 seconds: ")
         rate, data = capture(port)

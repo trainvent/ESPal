@@ -80,9 +80,43 @@ Host tests should focus on PCM/DSP, event parsing/fragment assembly and state tr
 
 ## Current status
 
-User reports the wiring is connected. The firmware is designed to boot idle and offer explicit USB `help`, `stats`, `tone` and `record` commands. Diagnostics allocate a shared-clock 48kHz duplex pair, report microphone levels/read timeouts and optionally emit a 200ms quiet tone. `cargo build --locked` passes, and the diagnostic firmware has been flashed. Boot logs and USB commands are verified. Microphone diagnostics captured 48,000 samples in one second with nonzero peak/RMS, no near-clipping and zero read timeouts. User heard a clear quiet test beep. Recorded-speech quality and sample alignment remain unverified. The recording command captures 72,000 native PCM24 samples (1.5s); its USB export passes exact-length and FNV-1a integrity checks on hardware. An initial export watchdog warning was fixed by yielding during the post-capture transfer; the repeat transfer had no watchdog warning. `tools/record.py` writes a verified WAV to the user document directory. Recognizable speech and DMA overrun/underrun telemetry remain outstanding. Installed tools: espup 0.18.0, espflash 4.6.0, ldproxy 0.3.5, Espressif Rust 1.97.0.0. The build pins esp-idf-svc 0.53.0 and ESP-IDF v5.5.5; transitive versions are recorded in Cargo.lock. PSRAM remains disabled until board validation.
+Hardware bring-up is verified: ESP32-S3 revision v0.2, 16MB flash, DIO at 40MHz,
+and 8MB octal PSRAM at 40MHz with a successful boot memory test. Firmware boots
+idle and responds to USB diagnostics. Microphone tests captured 48,000 samples
+per second without read timeouts or near clipping. User confirmed the quiet
+speaker beep and recognizable recorded speech in VLC; VS Code playback was the
+original recording issue. Both 1.5s and 5s PCM24 exports passed exact-length and
+FNV-1a checks; yielding during export fixed an initial watchdog warning.
 
-Manual B1-to-GND plus RST successfully changed USB enumeration from Arduino 2341:0070 to Espressif 303a:1001. The ROM reports ESP32-S3 revision v0.2, 40MHz crystal and 16MB flash, with secure boot and flash encryption disabled. The diagnostic application, matching ESP-IDF bootloader and single-app partition table were flashed successfully using DIO/40MHz and a 16MB flash header. Boot logs confirm the matching ESP-IDF application starts successfully. USB help/stats/tone commands work. Opening the Python serial connection with both modem-control lines false caused a USB chip reset; allow 700ms startup before sending commands. Reset-driven USB re-enumeration can remove the temporary serial ACL and require restoring access. User authorized replacing the existing application. See README.md for setup and download-mode instructions.
+Rust now implements filtered PCM conversion (63-tap FIR, 48→24kHz PCM16 and
+24→48kHz playback), bounded fragmented Realtime messages, local NVS provisioning,
+Wi-Fi/DHCP/SNTP, certificate-validated TLS/WebSocket transport and a manual
+five-second spoken turn. Eight host tests pass. The final networking build was
+flashed and its USB commands verified. The on-device quiet filtered pipeline
+test passed (48→24→48kHz), including complete playback queue draining.
+Live Wi-Fi/DHCP/SNTP, TLS certificate validation, OpenAI authentication and
+24kHz session configuration passed on 2026-10-09 using locally provisioned
+credentials. The `check` command performs this verification without microphone
+capture/upload. A spoken request and audible API response remain to verify.
+The current bench turn captures before uploading 20ms chunks; continuous input
+queues, multi-turn VAD sessions, capped reconnect backoff, DMA overrun/underrun
+telemetry and TLS-load memory/stack measurements remain outstanding.
+
+The full firmware exceeds the old 1MiB app partition. `tools/flash.sh` selects
+the matching ESP-IDF bootloader and repository `partitions.csv` (3MiB factory app,
+unchanged NVS/PHY offsets). Use this helper instead of the generated default
+partition artifact. Credentials are entered with `tools/provision.py`, not stored
+in source or a host file. Model/voice/instructions/gain are configurable; the
+initial model follows current official examples and actual project access is
+verified by successful session setup. The API turn is limited to 60 seconds, with gated microphone
+uploads, 100ms playback priming, a two-second output buffer and clean cancellation.
+
+Installed tools: espup 0.18.0, espflash 4.6.0, ldproxy 0.3.5, Espressif Rust
+1.97.0.0. Build pins esp-idf-svc 0.53.0, ESP-IDF v5.5.5 and WebSocket component
+1.6.1; Rust and component lockfiles record transitive versions. Manual B1-to-GND
+plus RST initially enabled download mode; native USB reset now works. USB reset
+can remove a temporary serial ACL. The local Python tools allow 1.5s for startup
+including the PSRAM test. Normal operation is entirely Rust on the Nano.
 
 ## Sources
 
