@@ -16,11 +16,26 @@ Initial device checks passed: idle boot and USB commands, 48,000 microphone samp
   timeouts. The assumed signed 24-bit alignment still needs speech validation.
 - `tone`: run the same diagnostic with a 200 ms, 440 Hz tone at 1% digital full
   scale and a 10 ms envelope. Actual speaker loudness depends on the amplifier.
+- `record`: capture 1.5 seconds (72,000 samples) of native mono PCM24 with silent
+  output, stop both channels, then export bounded hexadecimal chunks and an
+  FNV-1a checksum over USB. Requires 216KB of available contiguous capture memory;
+  allocation or capture failure aborts the recording.
 
 Commands end with Enter. The command buffer is capped at 64 bytes. Both I2S
-channels stop after each diagnostic, including an error. These are initial
-bench commands; DMA overrun/underrun telemetry and recording export remain to
-be implemented.
+channels stop after each diagnostic, including an error. DMA overrun/underrun
+telemetry remains to be implemented.
+
+To record speech, run this locally, press Enter when ready, then speak immediately:
+
+```sh
+python3 tools/record.py
+```
+
+The tool requires `pyserial`, verifies the exact length and checksum before
+writing a mono PCM24 WAV, and defaults to
+`/home/leonmarq/Dokumente/Codex/ESPal/microphone-speech.wav`. Choose a different
+filename with `--output` for subsequent recordings; it refuses to overwrite.
+The saved samples have no gain or resampling. USB port access is required.
 
 Build dependencies are locked in `Cargo.lock`. The initial stack uses
 `esp-idf-svc` 0.53.0 and ESP-IDF v5.5.5. The development toolchain installed for
@@ -63,8 +78,8 @@ is disabled during initial bring-up. Do not treat a build as an audio test.
 ## Next milestones
 
 1. Flash and verify idle boot logs; establish flash and PSRAM configuration.
-2. Verify the microphone statistics and quiet tone on hardware, then add
-   recording export and DMA overrun/underrun telemetry.
+2. Verify recognizable recorded speech and sample alignment, then add DMA
+   overrun/underrun telemetry.
 3. Add and test PCM conversion, filtered resampling and bounded audio queues.
 4. Add local NVS provisioning, Wi-Fi/SNTP and verified TLS/WebSocket transport.
 5. Complete a manually delimited OpenAI voice turn, then finite conversations.

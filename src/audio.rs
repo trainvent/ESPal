@@ -15,6 +15,41 @@ pub struct Diagnostics {
 }
 
 impl Diagnostics {
+    pub fn record(&mut self) -> Result<Vec<u8>, EspError> {
+        // 5 seconds of native 48kHz PCM24. Export only after DMA is stopped.
+        let mut pcm = Vec::new();
+        pcm.try_reserve_exact(240_000 * 3)
+            .map_err(|_| EspError::from_infallible::<{ esp_idf_svc::sys::ESP_ERR_NO_MEM }>())?;
+        self.driver.preload_data(&[0; FRAMES * 8])?;
+        self.driver.rx_enable()?;
+        if let Err(e) = self.driver.tx_enable() {
+            let _ = self.driver.rx_disable();
+            return Err(e);
+        }
+        let result = (|| {
+            let mut input = [0u8; FRAMES * 8];
+            let timeout = TickType::new_millis(100).ticks();
+            while pcm.len() < 240_000 * 3 {
+                let n = self.driver.read(&mut input, timeout)?;
+                if n == 0 || n % 8 != 0 {
+                    return Err(EspError::from_infallible::<{ esp_idf_svc::sys::ESP_FAIL }>());
+                }
+                for frame in input[..n].chunks_exact(8) {
+                    if pcm.len() == 240_000 * 3 {
+                        break;
+                    }
+                    // Preserve the upper 24 bits; no gain or resampling.
+                    pcm.extend_from_slice(&frame[1..4]);
+                }
+            }
+            Ok(())
+        })();
+        let tx = self.driver.tx_disable();
+        let rx = self.driver.rx_disable();
+        result.and(tx).and(rx)?;
+        Ok(pcm)
+    }
+
     pub fn new() -> Result<Self, EspError> {
         let p = Peripherals::take()?;
         let config = StdConfig::new(
