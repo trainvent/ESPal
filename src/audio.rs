@@ -185,6 +185,53 @@ impl Diagnostics {
         result
     }
 
+    pub fn tone16(
+        i2s: esp_idf_svc::hal::i2s::I2S0<'static>,
+        pins: esp_idf_svc::hal::gpio::Pins,
+    ) -> Result<(), EspError> {
+        // A separate TX-only initialization avoids runtime duplex format changes.
+        let config = StdConfig::new(
+            Config::default()
+                .dma_buffer_count(DMA_BUFFERS as u32)
+                .auto_clear(true)
+                .frames_per_buffer(FRAMES as u32),
+            StdClkConfig::from_sample_rate_hz(RATE),
+            StdSlotConfig::philips_slot_default(DataBitWidth::Bits16, SlotMode::Stereo),
+            StdGpioConfig::default(),
+        );
+        let mut driver = I2sDriver::new_std_tx(
+            i2s,
+            &config,
+            pins.gpio5,
+            pins.gpio8,
+            None::<AnyIOPin>,
+            pins.gpio6,
+        )?;
+        let silence = vec![0; FRAMES * 4 * DMA_BUFFERS];
+        driver.preload_data(&silence)?;
+        driver.tx_enable()?;
+        let result = (|| {
+            let mut output = [0u8; FRAMES * 4];
+            let timeout = TickType::new_millis(100).ticks();
+            for block in 0..200 {
+                for (index, frame) in output.chunks_exact_mut(4).enumerate() {
+                    let t = (block * FRAMES + index) as f64 / RATE as f64 - 0.1;
+                    let envelope = (t / 0.01).min((0.2 - t) / 0.01).clamp(0.0, 1.0);
+                    let sample =
+                        ((t * 440.0 * std::f64::consts::TAU).sin() * envelope * 327.0) as i16;
+                    frame[..2].copy_from_slice(&sample.to_le_bytes());
+                    frame[2..].copy_from_slice(&sample.to_le_bytes());
+                }
+                driver.write_all(&output, timeout)?;
+            }
+            Ok(())
+        })();
+        let stop = driver.tx_disable();
+        result.and(stop)?;
+        log::info!("16-bit TX-only tone complete; reset before another audio command");
+        Ok(())
+    }
+
     pub fn record(&mut self) -> Result<Vec<u8>, EspError> {
         // 5 seconds of native 48kHz PCM24. Export only after DMA is stopped.
         let mut pcm = Vec::new();

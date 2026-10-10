@@ -96,6 +96,10 @@ fn main() {
                                         } else { conversation::turn(audio.as_mut().unwrap(),c)?; }
                                     }
                                 },
+                                "tone16"=>{
+                                    let (i2s,pins)=hardware.take().ok_or("Reset before the isolated tone test")?;
+                                    audio::Diagnostics::tone16(i2s,pins).map_err(|e|{log::error!("16-bit tone driver error: {e}");"16-bit tone failed; reset before further audio use"})?;
+                                },
                                 "stats" | "tone" | "record" | "pipeline"=>{
                                     if audio.is_none() {
                                         let (i2s,pins)=hardware.take().ok_or("Audio initialization requires restart")?;

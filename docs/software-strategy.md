@@ -158,3 +158,9 @@ to sixteen 5ms descriptors (30→80ms), covering previously measured 32–45ms
 processing stalls. Playback diagnostics include the speaker divisor. These
 changes need a listening check; excessive output level is the current leading
 explanation for distortion.
+
+The user confirmed the checksum-verified captured OpenAI reply WAV sounds clear
+in VLC. Remaining distortion is therefore downstream of decoded incoming PCM.
+Local zero-PCM (`stats`) and quiet-tone tests are requested to distinguish
+playback processing from I2S wiring/amplifier/power behavior. No hardware cause
+has yet been established.

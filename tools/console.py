@@ -7,7 +7,7 @@ import serial
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["help", "stats", "tone", "pipeline", "connect", "check", "turn", "forget"])
+    parser.add_argument("command", choices=["help", "stats", "tone", "tone16", "pipeline", "connect", "check", "turn", "forget"])
     parser.add_argument("--port", default="/dev/ttyACM0")
     args = parser.parse_args()
     port = serial.Serial()
@@ -33,9 +33,11 @@ def main():
                     return
                 if b"espal:" in line and b"E (" in line:
                     return
+                if args.command == "tone16" and b"16-bit TX-only tone complete;" in line:
+                    return
                 if args.command == "pipeline" and b"Filtered pipeline test complete:" in line:
                     return
-                if args.command in ("help", "stats", "tone", "forget") and b"espal" in line:
+                if args.command in ("help", "stats", "tone", "tone16", "forget") and b"espal" in line:
                     return
         raise TimeoutError("No command completion within the deadline")
     finally:
