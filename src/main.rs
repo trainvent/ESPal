@@ -8,7 +8,10 @@ use esp_idf_svc::{hal::peripherals::Peripherals, nvs::EspDefaultNvsPartition};
 use std::{io::Read, time::Duration};
 
 fn export_recording(pcm: &[u8]) {
-    println!("ESPAL_RECORD 48000 240000 {}", pcm.len());
+    export_pcm(pcm, "ESPAL_RECORD", 48000, 3);
+}
+fn export_pcm(pcm: &[u8], marker: &str, rate: usize, width: usize) {
+    println!("{marker} {rate} {} {}", pcm.len() / width, pcm.len());
     let mut checksum = 2166136261u32;
     for (index, chunk) in pcm.chunks(48).enumerate() {
         let mut hex = String::with_capacity(100);
@@ -23,7 +26,7 @@ fn export_recording(pcm: &[u8]) {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    println!("ESPAL_RECORD_END {checksum:08x}");
+    println!("{marker}_END {checksum:08x}");
 }
 
 fn main() {
@@ -75,19 +78,22 @@ fn main() {
                             match command {
                                 "help"=>log::info!("stats, tone, record (5s); connect (Wi-Fi/time); check (OpenAI session); pipeline (filtered tone); turn (5s spoken request); forget"),
                                 "forget"=>{store.forget()?;config=None;if let Some(n)=network.as_mut(){network::Network::stop(n);}log::info!("Credentials removed");},
-                                "connect" | "check" | "turn"=>{
+                                "connect" | "check" | "turn" | "turn-capture"=>{
                                     let c=config.as_ref().ok_or("Run tools/provision.py first")?;
                                     if network.is_none() {
                                         network=Some(network::Network::new(modem.take().ok_or("Network initialization requires restart")?,partition.clone())?);
                                     }
                                     network.as_mut().unwrap().connect(c)?;
                                     if command=="check" { conversation::check(c)?; }
-                                    if command=="turn" {
+                                    if command=="turn" || command=="turn-capture" {
                                         if audio.is_none() {
                                             let (i2s,pins)=hardware.take().ok_or("Audio initialization requires restart")?;
                                             audio=Some(audio::Diagnostics::new(i2s,pins).map_err(|_|"Audio initialization failed")?);
                                         }
-                                        conversation::turn(audio.as_mut().unwrap(),c)?;
+                                        if command=="turn-capture" {
+                                            let pcm=conversation::capture_reply(audio.as_mut().unwrap(),c)?;
+                                            export_pcm(&pcm,"ESPAL_REPLY",24000,2);
+                                        } else { conversation::turn(audio.as_mut().unwrap(),c)?; }
                                     }
                                 },
                                 "stats" | "tone" | "record" | "pipeline"=>{

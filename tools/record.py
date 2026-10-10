@@ -8,8 +8,9 @@ from pathlib import Path
 import serial
 
 
-def capture(port):
-    port.write(b"record\n")
+def capture(port, reply=False):
+    marker = b"ESPAL_REPLY" if reply else b"ESPAL_RECORD"
+    port.write(b"turn-capture\n" if reply else b"record\n")
     deadline = time.monotonic() + 90
     data = bytearray()
     header = None
@@ -18,11 +19,12 @@ def capture(port):
         line = port.readline(1025)
         if len(line) > 1024:
             raise ValueError("Oversized export line")
-        if line.startswith(b"ESPAL_RECORD "):
+        if line.startswith(marker + b" "):
             if header is not None:
                 raise ValueError("Duplicate recording header")
             rate, frames, size = map(int, line.split()[1:])
-            if (rate, frames, size) != (48000, 240000, 720000):
+            valid = (rate == 24000 and 0 < frames <= 480000 and size == frames * 2) if reply else (rate, frames, size) == (48000, 240000, 720000)
+            if not valid:
                 raise ValueError("Unexpected recording dimensions")
             header = (rate, size)
         elif line.startswith(b"PCM "):
@@ -34,12 +36,14 @@ def capture(port):
             data.extend(chunk)
             for byte in chunk:
                 checksum = ((checksum ^ byte) * 16777619) & 0xFFFFFFFF
-        elif line.startswith(b"ESPAL_RECORD_END "):
+        elif line.startswith(marker + b"_END "):
             if header is None or len(data) != header[1]:
                 raise ValueError("Incomplete recording")
             if int(line.split()[1], 16) != checksum:
                 raise ValueError("Recording checksum mismatch")
             return header[0], data
+        elif b"E (" in line and b"espal:" in line:
+            raise RuntimeError(line.decode("utf-8", "replace").strip())
         elif line:
             print(line.decode("utf-8", "replace").strip())
     raise TimeoutError("No complete recording within 90 seconds")

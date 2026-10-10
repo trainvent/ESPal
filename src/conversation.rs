@@ -78,7 +78,7 @@ pub fn check(config: &Config) -> Result<(), &'static str> {
     Ok(())
 }
 
-pub fn turn(audio: &mut Diagnostics, config: &Config) -> Result<(), &'static str> {
+fn request(audio: &mut Diagnostics, config: &Config) -> Result<(Socket, Instant), &'static str> {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut socket = open_session(config, deadline)?;
     log::info!("LISTENING: speak now for five seconds");
@@ -106,6 +106,34 @@ pub fn turn(audio: &mut Diagnostics, config: &Config) -> Result<(), &'static str
     drop(raw);
     socket.send(&json!({"type":"input_audio_buffer.commit"}))?;
     socket.send(&json!({"type":"response.create"}))?;
+    Ok((socket, deadline))
+}
+
+pub fn capture_reply(audio: &mut Diagnostics, config: &Config) -> Result<Vec<u8>, &'static str> {
+    let (mut socket, deadline) = request(audio, config)?;
+    let mut pcm = Vec::new();
+    loop {
+        let event = socket.receive(deadline)?;
+        check_error(&event)?;
+        if let Some(bytes) = realtime::audio_delta(&event)? {
+            if pcm.len() + bytes.len() > 960000 {
+                return Err("Reply capture exceeds twenty seconds");
+            }
+            pcm.try_reserve(bytes.len())
+                .map_err(|_| "Reply capture allocation failed")?;
+            pcm.extend(bytes);
+        }
+        if event["type"] == "response.done" {
+            if event["response"]["status"] != "completed" || pcm.is_empty() {
+                return Err("Reply capture did not complete");
+            }
+            return Ok(pcm);
+        }
+    }
+}
+
+pub fn turn(audio: &mut Diagnostics, config: &Config) -> Result<(), &'static str> {
+    let (mut socket, deadline) = request(audio, config)?;
     log::info!("Waiting for spoken response; microphone upload gated");
     let (sender, receiver) = mpsc::sync_channel(256);
     let queued = AtomicUsize::new(0);
