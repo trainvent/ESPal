@@ -24,6 +24,7 @@ enum Incoming {
 struct Context {
     sender: SyncSender<Incoming>,
     failed: AtomicBool,
+    overflowed: AtomicBool,
 }
 
 fn connection_error(status: i32) -> &'static str {
@@ -90,6 +91,7 @@ unsafe extern "C" fn callback(
         _ => return,
     };
     if ctx.sender.try_send(event).is_err() {
+        ctx.overflowed.store(true, Ordering::Release);
         ctx.failed.store(true, Ordering::Release);
     }
 }
@@ -112,10 +114,11 @@ impl Socket {
         .map_err(|_| "Invalid URL")?;
         let headers = CString::new(format!("Authorization: Bearer {}\r\n", c.api_key))
             .map_err(|_| "Invalid authentication header")?;
-        let (sender, receiver) = mpsc::sync_channel(32);
+        let (sender, receiver) = mpsc::sync_channel(256);
         let context = Box::new(Context {
             sender,
             failed: AtomicBool::new(false),
+            overflowed: AtomicBool::new(false),
         });
         let config = esp_websocket_client_config_t {
             uri: uri.as_ptr(),
@@ -127,7 +130,7 @@ impl Socket {
             transport: esp_websocket_transport_t_WEBSOCKET_TRANSPORT_OVER_SSL,
             crt_bundle_attach: Some(esp_crt_bundle_attach),
             skip_cert_common_name_check: false,
-            network_timeout_ms: 5000,
+            network_timeout_ms: 15000,
             ping_interval_sec: 15,
             pingpong_timeout_sec: 10,
             ..Default::default()
@@ -158,7 +161,7 @@ impl Socket {
         if unsafe { esp_websocket_client_start(handle) } != ESP_OK {
             return Err("WebSocket start failed");
         }
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if socket.context.failed.load(Ordering::Acquire) {
                 return Err("WebSocket connection failed");
@@ -195,7 +198,11 @@ impl Socket {
     pub fn receive(&mut self, deadline: Instant) -> Result<serde_json::Value, &'static str> {
         loop {
             if self.context.failed.load(Ordering::Acquire) {
-                return Err("WebSocket receive failed or queue overflowed");
+                return Err(if self.context.overflowed.load(Ordering::Acquire) {
+                    "WebSocket fragment queue overflow (256 fragments)"
+                } else {
+                    "Invalid WebSocket callback fragment"
+                });
             }
             if Instant::now() >= deadline {
                 return Err("Realtime session deadline exceeded");

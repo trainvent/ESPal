@@ -33,7 +33,9 @@ def main():
                     return
                 if b"espal:" in line and b"E (" in line:
                     return
-                if args.command in ("help", "stats", "tone", "pipeline", "forget") and b"espal" in line:
+                if args.command == "pipeline" and b"Filtered pipeline test complete:" in line:
+                    return
+                if args.command in ("help", "stats", "tone", "forget") and b"espal" in line:
                     return
         raise TimeoutError("No command completion within the deadline")
     finally:

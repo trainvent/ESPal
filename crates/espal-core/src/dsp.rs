@@ -126,7 +126,8 @@ impl Downsampler {
 }
 
 pub struct Upsampler {
-    fir: Fir,
+    history: [f32; 32],
+    cursor: usize,
 }
 impl Default for Upsampler {
     fn default() -> Self {
@@ -135,15 +136,28 @@ impl Default for Upsampler {
 }
 impl Upsampler {
     pub fn new() -> Self {
-        Self { fir: Fir::new() }
+        Self {
+            history: [0.0; 32],
+            cursor: 0,
+        }
     }
     /// Zero insertion and reconstruction filtering; fixed gain prevents the
     /// amplitude loss from zero stuffing. Output at 48kHz, no slot conversion.
     pub fn push(&mut self, sample: i16) -> [i16; 2] {
-        [
-            pcm16(self.fir.push(sample as f32 * 2.0)),
-            pcm16(self.fir.push(0.0)),
-        ]
+        // Polyphase form of the same zero-stuffed FIR: skip multiplications
+        // by inserted zeros and compute both output phases from input history.
+        self.history[self.cursor] = sample as f32 * 2.0;
+        let mut even = 0.0;
+        let mut odd = 0.0;
+        for index in 0..32 {
+            let value = self.history[(self.cursor + 32 - index) & 31];
+            even += TAPS[index * 2] * value;
+            if index < 31 {
+                odd += TAPS[index * 2 + 1] * value;
+            }
+        }
+        self.cursor = (self.cursor + 1) & 31;
+        [pcm16(even), pcm16(odd)]
     }
 }
 
@@ -165,6 +179,19 @@ mod tests {
             }
         }
         (energy / count as f32).sqrt()
+    }
+    #[test]
+    fn polyphase_matches_zero_stuffed_reference() {
+        let mut reference = Fir::new();
+        let mut optimized = Upsampler::new();
+        for index in 0..4096 {
+            let sample = ((index * 7919 % 65536) as i32 - 32768) as i16;
+            let expected = [
+                pcm16(reference.push(sample as f32 * 2.0)),
+                pcm16(reference.push(0.0)),
+            ];
+            assert_eq!(optimized.push(sample), expected);
+        }
     }
     #[test]
     fn anti_alias_filter() {

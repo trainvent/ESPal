@@ -105,12 +105,13 @@ synchronization. `check` verifies OpenAI authentication and audio session config
 without capturing or uploading microphone audio. `turn` opens a certificate/hostname-validated WebSocket to
 OpenAI, configures mono 24kHz PCM16 with turn detection disabled, then prints
 `LISTENING`. Speak for five seconds at that point. The Nano captures locally,
-filters 48→24kHz with a 63-tap low-pass FIR, sends 20ms base64 PCM chunks,
+filters 48→24kHz with a 63-tap low-pass FIR, sends 100ms base64 PCM chunks,
 commits the turn, and requests a spoken response.
 
-The response runs through a bounded speaker task: 100ms priming, a two-second
+The response runs through a bounded speaker task: 100ms priming, a ten-second
 PCM limit, filtered 24→48kHz interpolation, and mono duplicated into both I2S
-slots. Microphone uploads stay gated during playback and a 500ms acoustic tail.
+slots. Speaker output is attenuated 16× (-24dB) for bench testing, with 80ms
+of I2S DMA buffering. Microphone uploads stay gated during playback and a 500ms acoustic tail.
 A 60-second deadline bounds the API turn. Overflow/disconnect/error cancels the
 response, stops audio and closes the socket. Automatic reconnect is disabled
 for this first bench version, so authentication errors cannot cause a retry storm.

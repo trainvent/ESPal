@@ -20,6 +20,10 @@ pub enum Playback {
 
 const RATE: u32 = 48_000;
 const FRAMES: usize = 240;
+// 80ms of hardware buffering covers the measured Wi-Fi scheduling stalls.
+const DMA_BUFFERS: usize = 16;
+// Conservative bench speaker level: -24dB relative to received PCM.
+const SPEAKER_DIVISOR: i32 = 16;
 
 pub struct Diagnostics {
     driver: I2sDriver<'static, I2sBiDir>,
@@ -28,7 +32,7 @@ pub struct Diagnostics {
 impl Diagnostics {
     fn preload_silence(&mut self) -> Result<(), EspError> {
         // Clear every DMA descriptor, including unsent data after cancellation.
-        let silence = vec![0; FRAMES * 8 * 6];
+        let silence = vec![0; FRAMES * 8 * DMA_BUFFERS];
         let loaded = self.driver.preload_data(&silence)?;
         if loaded != silence.len() {
             return Err(EspError::from_infallible::<{ esp_idf_svc::sys::ESP_FAIL }>());
@@ -68,6 +72,11 @@ impl Diagnostics {
             let _ = self.driver.rx_disable();
             return Err("Playback enable failed");
         }
+        let started = Instant::now();
+        let mut played_samples = 0usize;
+        let mut gaps = 0usize;
+        let mut peak = 0i32;
+        let mut max_conversion_us = 0u128;
         let result = (|| {
             let mut filter = espal_core::dsp::Upsampler::new();
             let mut output = vec![0u8; 480 * 2 * 8];
@@ -85,6 +94,7 @@ impl Diagnostics {
                             return Err("Playback queue disconnected")
                         }
                         Err(RecvTimeoutError::Timeout) => {
+                            gaps += 1;
                             // Maintain the duplex bus with silence during network gaps.
                             self.driver
                                 .write_all(&[0; FRAMES * 8], timeout)
@@ -101,6 +111,7 @@ impl Diagnostics {
                 if pending.is_empty() && ended {
                     break;
                 }
+                let conversion_started = Instant::now();
                 output.fill(0);
                 let samples = (pending.len() / 2).min(480);
                 for index in 0..samples {
@@ -108,14 +119,17 @@ impl Diagnostics {
                         pending.pop_front().unwrap(),
                         pending.pop_front().unwrap(),
                     ]);
+                    peak = peak.max(i32::from(sample).abs());
                     for (phase, value) in filter.push(sample).into_iter().enumerate() {
-                        let word = (i32::from(value) << 16).to_le_bytes();
+                        let word = ((i32::from(value) / SPEAKER_DIVISOR) << 16).to_le_bytes();
                         let frame =
                             &mut output[(index * 2 + phase) * 8..(index * 2 + phase + 1) * 8];
                         frame[..4].copy_from_slice(&word);
                         frame[4..].copy_from_slice(&word);
                     }
                 }
+                max_conversion_us = max_conversion_us.max(conversion_started.elapsed().as_micros());
+                played_samples += samples;
                 queued.fetch_sub(samples * 2, Ordering::AcqRel);
                 self.driver
                     .write_all(&output, timeout)
@@ -136,7 +150,7 @@ impl Diagnostics {
             for _ in 0..4 {
                 for frame in output.chunks_exact_mut(16) {
                     for (phase, value) in filter.push(0).into_iter().enumerate() {
-                        let word = (i32::from(value) << 16).to_le_bytes();
+                        let word = ((i32::from(value) / SPEAKER_DIVISOR) << 16).to_le_bytes();
                         frame[phase * 8..phase * 8 + 4].copy_from_slice(&word);
                         frame[phase * 8 + 4..phase * 8 + 8].copy_from_slice(&word);
                     }
@@ -162,6 +176,7 @@ impl Diagnostics {
             }
             Ok(())
         })();
+        log::info!("Playback: pcm24_samples={played_samples} elapsed_ms={} network_gaps={gaps} peak16={peak} max_20ms_conversion_us={max_conversion_us} speaker_divisor={SPEAKER_DIVISOR}", started.elapsed().as_millis());
         let tx = self.driver.tx_disable();
         let rx = self.driver.rx_disable();
         if tx.is_err() || rx.is_err() {
@@ -211,6 +226,7 @@ impl Diagnostics {
     ) -> Result<Self, EspError> {
         let config = StdConfig::new(
             Config::default()
+                .dma_buffer_count(DMA_BUFFERS as u32)
                 .auto_clear(true)
                 .frames_per_buffer(FRAMES as u32),
             StdClkConfig::from_sample_rate_hz(RATE),

@@ -84,20 +84,22 @@ pub fn turn(audio: &mut Diagnostics, config: &Config) -> Result<(), &'static str
     log::info!("LISTENING: speak now for five seconds");
     let raw = audio.record().map_err(|_| "Microphone capture failed")?;
     let mut down = Downsampler::new(config.mic_gain);
-    let mut chunk = Vec::with_capacity(960);
+    let mut chunk = Vec::with_capacity(4800);
     log::info!("Uploading filtered 24kHz PCM16");
     for frame in raw.chunks_exact(3) {
         let word = i32::from_le_bytes([0, frame[0], frame[1], frame[2]]);
         if let Some(sample) = down.push_word(word) {
             chunk.extend_from_slice(&sample.to_le_bytes());
         }
-        if chunk.len() == 960 {
+        if chunk.len() == 4800 {
             if Instant::now() >= deadline {
                 return Err("Turn deadline exceeded while uploading");
             }
             socket.send(&realtime::append(&chunk))?;
             chunk.clear();
-            std::thread::sleep(Duration::from_millis(1));
+            // At 100Hz a 1ms sleep can round to zero RTOS ticks.
+            // Block for a full tick so Wi-Fi/idle tasks can run during upload.
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
     log::info!("Input conversion clipped samples={}", down.clipped);
@@ -105,9 +107,11 @@ pub fn turn(audio: &mut Diagnostics, config: &Config) -> Result<(), &'static str
     socket.send(&json!({"type":"input_audio_buffer.commit"}))?;
     socket.send(&json!({"type":"response.create"}))?;
     log::info!("Waiting for spoken response; microphone upload gated");
-    let (sender, receiver) = mpsc::sync_channel(64);
+    let (sender, receiver) = mpsc::sync_channel(256);
     let queued = AtomicUsize::new(0);
     let cancel = AtomicBool::new(false);
+    let mut received_bytes = 0usize;
+    let mut max_queued = 0usize;
     let result = std::thread::scope(|scope| {
         let queued_ref = &queued;
         let cancel_ref = &cancel;
@@ -126,9 +130,12 @@ pub fn turn(audio: &mut Diagnostics, config: &Config) -> Result<(), &'static str
                     if worker.is_finished() {
                         return Err("Speaker stopped before response completion");
                     }
-                    // A strict two-second PCM budget, including worker priming.
+                    // Allow response-generation bursts ahead of real-time playback.
+                    // Ten seconds of PCM (480KB) remains bounded and fits PSRAM.
+                    received_bytes += bytes.len();
                     let previous = queued.fetch_add(bytes.len(), Ordering::AcqRel);
-                    if previous + bytes.len() > 96000 {
+                    max_queued = max_queued.max(previous + bytes.len());
+                    if previous + bytes.len() > 480000 {
                         return Err("Playback overflow; response cancelled");
                     }
                     sender
@@ -154,6 +161,9 @@ pub fn turn(audio: &mut Diagnostics, config: &Config) -> Result<(), &'static str
         let played = worker.join().map_err(|_| "Speaker task panicked")?;
         stream.and(played)
     });
-    log::info!("Turn finished; audio stopped");
+    log::info!("Response audio: received_bytes={received_bytes} max_queued_bytes={max_queued}");
+    if result.is_ok() {
+        log::info!("Turn finished; audio stopped");
+    }
     result
 }

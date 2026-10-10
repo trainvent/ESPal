@@ -98,7 +98,7 @@ Live Wi-Fi/DHCP/SNTP, TLS certificate validation, OpenAI authentication and
 24kHz session configuration passed on 2026-10-09 using locally provisioned
 credentials. The `check` command performs this verification without microphone
 capture/upload. A spoken request and audible API response remain to verify.
-The current bench turn captures before uploading 20ms chunks; continuous input
+The current bench turn captures before uploading 100ms chunks; continuous input
 queues, multi-turn VAD sessions, capped reconnect backoff, DMA overrun/underrun
 telemetry and TLS-load memory/stack measurements remain outstanding.
 
@@ -109,7 +109,7 @@ partition artifact. Credentials are entered with `tools/provision.py`, not store
 in source or a host file. Model/voice/instructions/gain are configurable; the
 initial model follows current official examples and actual project access is
 verified by successful session setup. The API turn is limited to 60 seconds, with gated microphone
-uploads, 100ms playback priming, a two-second output buffer and clean cancellation.
+uploads, 100ms playback priming, a ten-second output buffer and clean cancellation.
 
 Installed tools: espup 0.18.0, espflash 4.6.0, ldproxy 0.3.5, Espressif Rust
 1.97.0.0. Build pins esp-idf-svc 0.53.0, ESP-IDF v5.5.5 and WebSocket component
@@ -126,3 +126,35 @@ including the PSRAM test. Normal operation is entirely Rust on the Nano.
 - [Espressif WebSocket component](https://github.com/espressif/esp-protocols/blob/master/components/esp_websocket_client/README.md)
 - [OpenAI WebSockets](https://developers.openai.com/api/docs/guides/voice-websockets)
 - [OpenAI Realtime client events](https://developers.openai.com/api/reference/resources/realtime/client-events)
+
+Playback investigation (2026-10-10): the original FIR interpolation took up to
+23,958us per 20ms audio block in an offline device test, exceeding its timing
+budget. Equivalent polyphase interpolation reduces the measured maximum to
+9,937us. Nine host tests pass, including exact PCM agreement with the original
+zero-stuffed FIR. The optimization is flashed; live speech playback still needs
+verification. Playback diagnostics now report conversion time, PCM count, peak,
+network gaps and queue high-water mark. Failed turns no longer print the success
+marker before the actual error, so the host console preserves failure details.
+
+The next live run confirmed `Playback overflow; response cancelled`: queued
+PCM reached 100,800 bytes, exceeding the initial 96,000-byte/two-second limit.
+The output budget is now 480,000 bytes (ten seconds), with 256 packet slots,
+using the Nano's PSRAM to absorb generation bursts. Conversion under live
+Wi-Fi load also reached 44,857us; timing counters remain enabled. Clear, complete
+playback still requires a live rerun with the larger buffer.
+
+A further live run failed in WebSocket reception with only 19,200 PCM bytes
+queued, plus an upload watchdog warning. The fragment callback queue grew from
+32 to 256 slots (each fragment is capped at 4096 bytes). Callback queue overflow
+and invalid metadata now have separate errors. Uploads now use 100ms PCM chunks
+and a 10ms scheduling pause at the configured 100Hz RTOS tick rate; this reduces
+message count fivefold and gives a full tick between sends. Live verification
+of these receive/upload changes remains pending.
+
+The receive/upload changes allowed a complete reply, but the user reported
+excessive loudness and unintelligible distortion. Speaker PCM is now attenuated
+by 16 (-24dB) before I2S conversion. Hardware DMA buffers increased from six
+to sixteen 5ms descriptors (30→80ms), covering previously measured 32–45ms
+processing stalls. Playback diagnostics include the speaker divisor. These
+changes need a listening check; excessive output level is the current leading
+explanation for distortion.
