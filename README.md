@@ -6,9 +6,24 @@ in [the software strategy](docs/software-strategy.md); connections are in
 
 ## Initial firmware
 
-The current application boots idle and accepts USB commands. It does not
-initialize audio until requested, and starts Wi-Fi only on `connect`, `check` or `turn`, and OpenAI on `check` or `turn`.
-Initial device checks passed: idle boot and USB commands, 48,000 microphone samples per second with no read timeouts, and an audible beep initially confirmed by the user. Later isolated tone tests are distorted, so speaker playback remains unresolved. User confirmed recognizable speech in VLC; VS Code playback was the original listening issue. The selected sample alignment is supported by that recording.
+The application supports USB bench commands and a saved standalone mode.
+`python3 tools/console.py standalone on` enables offline Jarvis listening after
+a five-second USB recovery window at boot. Say **Jarvis**, wait for the ready
+beep, then speak naturally. A 1.2-second pause ends the request; follow-up
+questions use the same OpenAI session. After 15 seconds without a new question,
+the Nano returns to offline wake listening. Idle wake audio stays on the Nano.
+Cedar remains the reply voice. Continuous input has a ten-minute limit, and
+each conversation has an eleven-minute deadline.
+
+`python3 tools/console.py standalone off` restores bench mode. Opening the
+console resets the board; send this command within the five-second boot window.
+The offline wake model uses ESP-SR 2.0.5 in a separate model partition; the flash
+helper packs and writes it without changing NVS/PHY offsets. Boot and speech
+acceptance for standalone mode are recorded in the software strategy.
+
+Microphone recording and clean speaker speech are verified. TX-first duplex
+initialization fixed speaker distortion. Both input and reply audio now stream
+through bounded queues, with Cedar voice and 4× speaker attenuation.
 
 - `help`: display the command descriptions.
 - `stats`: run shared-clock duplex I2S for one second, transmitting silence,
@@ -108,12 +123,12 @@ recording played correctly in VLC. Keep credentials out of chat and source.
 synchronization. `check` verifies OpenAI authentication and audio session configuration
 without capturing or uploading microphone audio. `turn` opens a certificate/hostname-validated WebSocket to
 OpenAI, configures mono 24kHz PCM16 with turn detection disabled, then prints
-`LISTENING`. Speak for five seconds at that point. Separate tasks capture the
+`LISTENING`. Speak naturally until finished. Separate tasks capture the
 microphone, filter 48→24kHz with a 63-tap low-pass FIR, and upload 100ms base64
 PCM chunks while you speak. Two bounded queues each hold up to two seconds
 between stages. Upload temporarily uses the same priority as the audio workers;
 its original priority is restored afterward. The turn is committed only after
-all 240,000 native samples become 240,000 uploaded PCM bytes and both queues
+all emitted native samples become the matching number of uploaded PCM bytes and both queues
 drain. An overflow or upload failure cancels input and closes the session.
 `Input streaming:` logs capture time, total time, buffer peaks and clipping.
 
@@ -125,7 +140,7 @@ This allows speech to begin before the complete reply arrives. Playback logs
 report preparation gaps; filter and DMA tasks preserve sample order.
 Speaker output is attenuated 4× (-12dB), with 80ms of I2S DMA buffering.
 Microphone uploads stay gated during playback and a 500ms acoustic tail. The
-120-second diagnostic turn deadline and bounded packet queues remain enforced. Errors stop
+eleven-minute conversation deadline and bounded packet queues remain enforced. Errors stop
 audio and close the socket; automatic reconnect is disabled for bench testing.
 
 WebSocket callbacks only copy bounded fragments into a queue. JSON assembly

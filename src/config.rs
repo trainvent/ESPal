@@ -55,4 +55,16 @@ impl Store {
         result?;
         Ok(config)
     }
+    pub fn set_standalone(&self, enabled: bool) -> Result<Config, &'static str> {
+        let mut config = self.load()?.ok_or("Provision credentials first")?;
+        config.standalone = enabled;
+        let mut bytes = serde_json::to_vec(&config).map_err(|_| "Config encoding failed")?;
+        let result = self
+            .nvs
+            .set_blob("config", &bytes)
+            .map_err(|_| "NVS write failed");
+        bytes.fill(0);
+        result?;
+        Ok(config)
+    }
 }

@@ -11,6 +11,8 @@ pub struct Config {
     pub voice: String,
     pub instructions: String,
     pub mic_gain: u8,
+    #[serde(default)]
+    pub standalone: bool,
 }
 impl Config {
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -56,6 +58,16 @@ impl Config {
 mod tests {
     use super::*;
     #[test]
+    fn older_provisioning_defaults_to_bench_mode() {
+        let old = serde_json::json!({"ssid":"test", "password":"", "api_key":"test-key-not-a-real-secret", "model":"gpt-realtime-2.1", "voice":"cedar", "instructions":"Be brief", "mic_gain":1});
+        let mut config: Config = serde_json::from_value(old).unwrap();
+        assert!(!config.standalone);
+        config.validate().unwrap();
+        config.standalone = true;
+        let saved = serde_json::to_vec(&config).unwrap();
+        assert!(serde_json::from_slice::<Config>(&saved).unwrap().standalone);
+    }
+    #[test]
     fn prevents_header_and_url_injection() {
         let mut c = Config {
             ssid: "test".into(),
@@ -63,6 +75,7 @@ mod tests {
             api_key: "test-key-not-a-real-secret".into(),
             model: "gpt-realtime-2.1".into(),
             voice: "marin".into(),
+            standalone: false,
             instructions: "Be brief".into(),
             mic_gain: 8,
         };

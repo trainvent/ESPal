@@ -80,39 +80,40 @@ Host tests should focus on PCM/DSP, event parsing/fragment assembly and state tr
 
 ## Current status
 
-USB/firmware/microphone bring-up is verified; speaker acceptance remains open.
-The board is ESP32-S3 revision v0.2, with 16MB flash, DIO at 40MHz,
-and 8MB octal PSRAM at 40MHz with a successful boot memory test. Firmware boots
-idle and responds to USB diagnostics. Microphone tests captured 48,000 samples
-per second without read timeouts or near clipping. User initially heard the beep, but later isolated tone tests are still distorted.
-Recognizable microphone speech in VLC is confirmed; VS Code playback was the
-original recording issue. Both 1.5s and 5s PCM24 exports passed exact-length and
-FNV-1a checks; yielding during export fixed an initial watchdog warning.
+USB, microphone recording, Wi-Fi/SNTP, certificate-validated OpenAI sessions,
+and clean physical speaker playback are verified. Both input and output now
+stream through bounded queues. TX-first duplex initialization made the speaker
+clock master and fixed distortion. The board is an ESP32-S3 revision v0.2 with
+16MB DIO flash and 8MB octal PSRAM at 40MHz; its memory test passes.
 
-Rust now implements filtered PCM conversion (63-tap FIR, 48→24kHz PCM16 and
-24→48kHz playback), bounded fragmented Realtime messages, local NVS provisioning,
-Wi-Fi/DHCP/SNTP, certificate-validated TLS/WebSocket transport and a manual
-five-second spoken turn. Nine host tests pass. The final networking build was
-flashed and its USB commands verified. The on-device quiet filtered pipeline
-test passed (48→24→48kHz), including complete playback queue draining.
-Live Wi-Fi/DHCP/SNTP, TLS certificate validation, OpenAI authentication and
-24kHz session configuration passed on 2026-10-09 using locally provisioned
-credentials. The `check` command performs this verification without microphone
-capture/upload. Spoken requests produce complete responses after queue fixes,
-and the exported received-response WAV sounds clear in VLC. Clean physical speaker
-playback is now confirmed by the user after TX-master duplex initialization.
-The current bench turn captures before uploading 100ms chunks; continuous input
-queues, multi-turn VAD sessions, capped reconnect backoff, DMA overrun/underrun
-telemetry and TLS-load memory/stack measurements remain outstanding.
+Offline Jarvis activation and speech-ended input are implemented. Cedar remains
+the response voice. A saved standalone flag enables automatic local wake
+listening after a five-second USB recovery window. After Jarvis, Wi-Fi/OpenAI
+connect and a ready beep signals when to speak. A 300ms local preroll preserves
+the detected speech onset; a 1.2-second quiet interval ends input. Follow-up
+turns reuse the same OpenAI session; 15 seconds without new speech returns to
+local wake mode. Ten minutes is the continuous-input ceiling and eleven minutes
+the conversation deadline. Playback gates microphone upload through its 500ms
+acoustic tail. The speech endpoint uses adaptive energy thresholds, not semantic
+VAD or acoustic echo cancellation, so quiet speech and noisy rooms need testing.
 
-The full firmware exceeds the old 1MiB app partition. `tools/flash.sh` selects
-the matching ESP-IDF bootloader and repository `partitions.csv` (3MiB factory app,
-unchanged NVS/PHY offsets). Use this helper instead of the generated default
-partition artifact. Credentials are entered with `tools/provision.py`, not stored
-in source or a host file. Model/voice/instructions/gain are configurable; the
-initial model follows current official examples and actual project access is
-verified by successful session setup. The API turn is limited to 60 seconds, with gated microphone
-uploads, 100ms playback priming, a ten-second output buffer and clean cancellation.
+ESP-SR 2.0.5 supplies the offline 16kHz Jarvis model. A separate filtered
+48→16kHz decimator feeds it; idle audio stays local. The model partition starts
+at 0x310000 beyond the existing 3MiB factory app. NVS and PHY offsets are
+preserved. The flash helper packs the selected 285KiB model and writes it with
+the firmware. USB console recovery uses the buffered driver with nonblocking
+reads so power-only startup does not wait for input from a host.
+
+Fifteen host tests cover filters, signed conversion, fragmentation, configuration
+compatibility, and speech endpoint state transitions. Device model loading and
+capture/cancellation checks pass. Initial standalone startup exposed a crash in
+WakeNet clean() before its first inference; the wrapper now recreates used
+instances instead of calling that path. Repeated inference/recreation and
+automatic startup are verified: the Nano reaches WAKE READY after reset and
+remains stable through a 25-second monitoring window. Standalone startup is
+enabled in NVS. Physical Jarvis wake recognition and long-speech acceptance
+still need the user listening test. Earlier bring-up notes
+below describe intermediate behavior and limits superseded by this status.
 
 Installed tools: espup 0.18.0, espflash 4.6.0, ldproxy 0.3.5, Espressif Rust
 1.97.0.0. Build pins esp-idf-svc 0.53.0, ESP-IDF v5.5.5 and WebSocket component

@@ -468,6 +468,7 @@ impl Diagnostics {
         queued: &AtomicUsize,
         cancel: &AtomicBool,
         deadline: Instant,
+        speech: bool,
     ) -> Result<(usize, u128, usize), &'static str> {
         self.preload_silence()
             .map_err(|_| "Capture preload failed")?;
@@ -478,15 +479,23 @@ impl Diagnostics {
             let _ = self.driver.rx_disable();
             return Err("Capture TX enable failed");
         }
-        log::info!("LISTENING: speak now for five seconds; upload streams during capture");
+        if speech {
+            log::info!("LISTENING: speak naturally; a 1.2-second pause ends your request");
+        } else {
+            log::info!("LISTENING: speak now for five seconds; upload streams during capture");
+        }
         let started = Instant::now();
         let mut samples = 0usize;
         let mut max_queued = 0usize;
+        let mut emitted = 0usize;
         let result = (|| {
             let mut input = [0u8; FRAMES * 8];
             let mut block = Vec::with_capacity(2400);
             let timeout = TickType::new_millis(100).ticks();
-            while samples < 240_000 {
+            let mut gate = espal_core::speech::SpeechGate::default();
+            let mut preroll = std::collections::VecDeque::new();
+            let mut speaking = !speech;
+            'capture: loop {
                 if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
                     return Err("Microphone streaming cancelled");
                 }
@@ -503,21 +512,53 @@ impl Diagnostics {
                     block.push(i32::from_le_bytes(frame[..4].try_into().unwrap()));
                     samples += 1;
                     if block.len() == 2400 {
-                        let pending = queued.fetch_add(block.len(), Ordering::AcqRel) + block.len();
-                        max_queued = max_queued.max(pending);
-                        let len = block.len();
-                        if sender
-                            .try_send(std::mem::replace(&mut block, Vec::with_capacity(2400)))
-                            .is_err()
-                        {
-                            queued.fetch_sub(len, Ordering::AcqRel);
-                            return Err(
-                                "Microphone buffer overflow or filter stopped; input cancelled",
-                            );
+                        use espal_core::speech::State;
+                        let state = if speech {
+                            gate.push(&block)
+                        } else {
+                            State::Speaking
+                        };
+                        let block = std::mem::replace(&mut block, Vec::with_capacity(2400));
+                        let ready = if speaking {
+                            vec![block]
+                        } else {
+                            preroll.push_back(block);
+                            if preroll.len() > 6 {
+                                preroll.pop_front();
+                            }
+                            match state {
+                                State::Started => {
+                                    speaking = true;
+                                    log::info!("Speech started; streaming buffered onset");
+                                    preroll.drain(..).collect()
+                                }
+                                State::NoSpeech => return Err("No speech detected"),
+                                State::Limit => return Err("Speech input limit exceeded"),
+                                _ => Vec::new(),
+                            }
+                        };
+                        for block in ready {
+                            let len = block.len();
+                            let pending = queued.fetch_add(len, Ordering::AcqRel) + len;
+                            max_queued = max_queued.max(pending);
+                            if sender.try_send(block).is_err() {
+                                queued.fetch_sub(len, Ordering::AcqRel);
+                                return Err(
+                                    "Microphone buffer overflow or filter stopped; input cancelled",
+                                );
+                            }
+                            emitted += len;
+                        }
+                        if state == State::Limit {
+                            return Err("Speech input limit exceeded");
+                        }
+                        if state == State::Ended {
+                            log::info!("Speech ended after sustained silence");
+                            break 'capture;
                         }
                     }
-                    if samples == 240_000 {
-                        break;
+                    if !speech && samples == 240_000 {
+                        break 'capture;
                     }
                 }
             }
@@ -539,7 +580,59 @@ impl Diagnostics {
             return Err("Microphone capture shutdown failed");
         }
         log::info!("Capture finished; remaining microphone upload is draining");
-        Ok((samples, elapsed, max_queued))
+        Ok((emitted, elapsed, max_queued))
+    }
+
+    pub fn wait_for_wake(
+        &mut self,
+        detector: &mut crate::wake::Detector,
+        deadline: Instant,
+    ) -> Result<bool, &'static str> {
+        detector.reset()?;
+        self.preload_silence().map_err(|_| "Wake preload failed")?;
+        self.driver
+            .rx_enable()
+            .map_err(|_| "Wake RX enable failed")?;
+        if self.driver.tx_enable().is_err() {
+            let _ = self.driver.rx_disable();
+            return Err("Wake TX enable failed");
+        }
+        log::info!("WAKE READY: say Jarvis; idle audio stays local");
+        let result = (|| {
+            let mut filter = espal_core::dsp::WakeDownsampler::default();
+            let mut input = [0u8; FRAMES * 8];
+            let timeout = TickType::new_millis(100).ticks();
+            let mut samples = 0usize;
+            while Instant::now() < deadline {
+                let n = self
+                    .driver
+                    .read(&mut input, timeout)
+                    .map_err(|_| "Wake microphone read failed")?;
+                if n == 0 || n % 8 != 0 {
+                    return Err("Invalid wake DMA read");
+                }
+                for frame in input[..n].chunks_exact(8) {
+                    let word = i32::from_le_bytes(frame[..4].try_into().unwrap());
+                    if let Some(sample) = filter.push_word(word) {
+                        if detector.push(sample)? {
+                            log::info!("WAKE DETECTED: Jarvis");
+                            return Ok(true);
+                        }
+                    }
+                    samples += 1;
+                }
+                if samples % 4800 == 0 {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            Ok(false)
+        })();
+        let tx = self.driver.tx_disable();
+        let rx = self.driver.rx_disable();
+        if tx.is_err() || rx.is_err() {
+            return Err("Wake capture shutdown failed");
+        }
+        result
     }
 
     pub fn new(

@@ -83,6 +83,7 @@ pub fn check(config: &Config) -> Result<(), &'static str> {
 fn stream_input(
     audio: &mut Diagnostics,
     gain: u8,
+    speech: bool,
     deadline: Instant,
     mut upload: impl FnMut(&[u8]) -> Result<(), &'static str>,
 ) -> Result<(), &'static str> {
@@ -98,6 +99,22 @@ fn stream_input(
     let original_priority = unsafe { esp_idf_svc::sys::uxTaskPriorityGet(std::ptr::null_mut()) };
     let _priority = UploadPriority(original_priority);
     unsafe { esp_idf_svc::sys::vTaskPrioritySet(std::ptr::null_mut(), original_priority.max(5)) };
+    // Keep the continuous capture/filter workers off Wi-Fi's core. Long
+    // utterances cannot rely on accumulating a growing processing backlog.
+    use esp_idf_svc::hal::{cpu::Core, task::thread::ThreadSpawnConfiguration};
+    struct RestoreSpawnConfig(ThreadSpawnConfiguration);
+    impl Drop for RestoreSpawnConfig {
+        fn drop(&mut self) {
+            let _ = self.0.set();
+        }
+    }
+    let _spawn_config = RestoreSpawnConfig(ThreadSpawnConfiguration::get().unwrap_or_default());
+    ThreadSpawnConfiguration {
+        pin_to_core: Some(Core::Core1),
+        ..ThreadSpawnConfiguration::default()
+    }
+    .set()
+    .map_err(|_| "Input scheduling configuration failed")?;
     let (raw_sender, raw_receiver) = mpsc::sync_channel::<Vec<i32>>(40);
     let (pcm_sender, pcm_receiver) = mpsc::sync_channel::<Vec<u8>>(20);
     let raw_queued = AtomicUsize::new(0);
@@ -112,7 +129,8 @@ fn stream_input(
             .name("microphone".into())
             .stack_size(8192)
             .spawn_scoped(scope, move || {
-                let result = audio.stream_capture(raw_sender, raw_ref, cancel_ref, deadline);
+                let result =
+                    audio.stream_capture(raw_sender, raw_ref, cancel_ref, deadline, speech);
                 if result.is_err() {
                     cancel_ref.store(true, Ordering::Release);
                 }
@@ -155,10 +173,16 @@ fn stream_input(
                         }
                         raw_ref.fetch_sub(len, Ordering::AcqRel);
                     }
-                    if samples != 240_000 || !chunk.is_empty() {
-                        return Err("Input stream incomplete; turn not committed");
+                    if !chunk.is_empty() {
+                        let len = chunk.len();
+                        let pending = pcm_ref.fetch_add(len, Ordering::AcqRel) + len;
+                        max_queued = max_queued.max(pending);
+                        if pcm_sender.try_send(chunk).is_err() {
+                            pcm_ref.fetch_sub(len, Ordering::AcqRel);
+                            return Err("Final input upload buffer overflow");
+                        }
                     }
-                    Ok((down.clipped, max_queued))
+                    Ok((down.clipped, max_queued, samples))
                 })();
                 if result.is_err() { cancel_ref.store(true, Ordering::Release); }
                 result
@@ -215,8 +239,10 @@ fn stream_input(
         }
         sent?;
         let (samples, capture_ms, raw_max) = captured?;
-        let (clipped, pcm_max) = converted?;
-        if uploaded != 240_000
+        let (clipped, pcm_max, filtered_samples) = converted?;
+        if uploaded != samples
+            || filtered_samples != samples
+            || samples == 0
             || raw_queued.load(Ordering::Acquire) != 0
             || pcm_queued.load(Ordering::Acquire) != 0
         {
@@ -231,13 +257,23 @@ fn stream_input(
 /// Exercise the real capture/filter queues with a deliberately slower consumer,
 /// without sending audio over the network or playing it through the speaker.
 pub fn input_test(audio: &mut Diagnostics) -> Result<(), &'static str> {
-    stream_input(audio, 1, Instant::now() + Duration::from_secs(20), |_| {
-        std::thread::sleep(Duration::from_millis(120));
-        Ok(())
-    })?;
-    let failure = stream_input(audio, 1, Instant::now() + Duration::from_secs(5), |_| {
-        Err("Injected upload failure")
-    });
+    stream_input(
+        audio,
+        1,
+        false,
+        Instant::now() + Duration::from_secs(20),
+        |_| {
+            std::thread::sleep(Duration::from_millis(120));
+            Ok(())
+        },
+    )?;
+    let failure = stream_input(
+        audio,
+        1,
+        false,
+        Instant::now() + Duration::from_secs(5),
+        |_| Err("Injected upload failure"),
+    );
     if failure != Err("Injected upload failure") {
         return Err("Input cancellation test failed");
     }
@@ -249,9 +285,9 @@ pub fn input_test(audio: &mut Diagnostics) -> Result<(), &'static str> {
 }
 
 fn request(audio: &mut Diagnostics, config: &Config) -> Result<(Socket, Instant), &'static str> {
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_secs(660);
     let mut socket = open_session(config, deadline)?;
-    stream_input(audio, config.mic_gain, deadline, |chunk| {
+    stream_input(audio, config.mic_gain, true, deadline, |chunk| {
         socket.send(&realtime::append(chunk))
     })?;
     socket.send(&json!({"type":"input_audio_buffer.commit"}))?;
@@ -284,6 +320,60 @@ pub fn capture_reply(audio: &mut Diagnostics, config: &Config) -> Result<Vec<u8>
 
 pub fn turn(audio: &mut Diagnostics, config: &Config) -> Result<(), &'static str> {
     let (mut socket, deadline) = request(audio, config)?;
+    play_response(audio, &mut socket, deadline)
+}
+
+pub fn ready_chime(audio: &mut Diagnostics) -> Result<(), &'static str> {
+    let mut pcm = Vec::with_capacity(4800);
+    for index in 0..2400 {
+        let phase = index % 24;
+        let ramp = if phase < 12 { phase } else { 24 - phase };
+        let sample = ((ramp as i32 - 6) * 1600 / 6) as i16;
+        pcm.extend_from_slice(&sample.to_le_bytes());
+    }
+    let (sender, receiver) = mpsc::sync_channel(2);
+    let queued = AtomicUsize::new(pcm.len());
+    let cancel = AtomicBool::new(false);
+    sender
+        .send(Playback::Audio(pcm))
+        .map_err(|_| "Chime queue failed")?;
+    sender
+        .send(Playback::End)
+        .map_err(|_| "Chime queue failed")?;
+    audio.playback(
+        receiver,
+        &queued,
+        &cancel,
+        Instant::now() + Duration::from_secs(5),
+    )
+}
+
+pub fn session(audio: &mut Diagnostics, config: &Config) -> Result<(), &'static str> {
+    let deadline = Instant::now() + Duration::from_secs(660);
+    let mut socket = open_session(config, deadline)?;
+    ready_chime(audio)?;
+    log::info!("Conversation ready; speak after the beep");
+    while Instant::now() < deadline {
+        let input = stream_input(audio, config.mic_gain, true, deadline, |chunk| {
+            socket.send(&realtime::append(chunk))
+        });
+        if input == Err("No speech detected") {
+            log::info!("Conversation idle; returning to offline wake detection");
+            return Ok(());
+        }
+        input?;
+        socket.send(&json!({"type":"input_audio_buffer.commit"}))?;
+        socket.send(&json!({"type":"response.create"}))?;
+        play_response(audio, &mut socket, deadline)?;
+    }
+    Ok(())
+}
+
+fn play_response(
+    audio: &mut Diagnostics,
+    socket: &mut Socket,
+    deadline: Instant,
+) -> Result<(), &'static str> {
     log::info!("Waiting for spoken response; microphone upload gated");
     let (sender, receiver) = mpsc::sync_channel(512);
     let queued = AtomicUsize::new(0);

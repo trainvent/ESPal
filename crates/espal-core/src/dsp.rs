@@ -83,13 +83,16 @@ impl Fir {
         self.cursor = (self.cursor + 1) % 63;
     }
     fn output(&self) -> f32 {
+        self.output_with(&TAPS)
+    }
+    fn output_with(&self, taps: &[f32; 63]) -> f32 {
         let mut result = 0.0;
         let mut index = if self.cursor == 0 {
             62
         } else {
             self.cursor - 1
         };
-        for tap in TAPS {
+        for tap in taps {
             result += tap * self.history[index];
             index = if index == 0 { 62 } else { index - 1 };
         }
@@ -175,9 +178,124 @@ impl Upsampler {
     }
 }
 
+const WAKE_TAPS: [f32; 63] = [
+    -1.34932394668e-19f32,
+    3.76687698322e-06f32,
+    -1.82125347508e-05f32,
+    -9.43391178056e-05f32,
+    -0.0001532907693f32,
+    -4.01786368581e-05f32,
+    0.000313990088076f32,
+    0.000699405071441f32,
+    0.000652102959603f32,
+    -0.00017731941968f32,
+    -0.00151594548681f32,
+    -0.00231875069753f32,
+    -0.00137555913794f32,
+    0.00152075842012f32,
+    0.00475084187141f32,
+    0.00542849347449f32,
+    0.00151408682135f32,
+    -0.00580456123642f32,
+    -0.0116146227003f32,
+    -0.00999612267201f32,
+    0.00111892510647f32,
+    0.0163952737749f32,
+    0.0244892993464f32,
+    0.0151279428329f32,
+    -0.0118611235687f32,
+    -0.0420605758813f32,
+    -0.0513567001235f32,
+    -0.0192486387286f32,
+    0.0567495314559f32,
+    0.155151587874f32,
+    0.23830650571f32,
+    0.270826858055f32,
+    0.23830650571f32,
+    0.155151587874f32,
+    0.0567495314559f32,
+    -0.0192486387286f32,
+    -0.0513567001235f32,
+    -0.0420605758813f32,
+    -0.0118611235687f32,
+    0.0151279428329f32,
+    0.0244892993464f32,
+    0.0163952737749f32,
+    0.00111892510647f32,
+    -0.00999612267201f32,
+    -0.0116146227003f32,
+    -0.00580456123642f32,
+    0.00151408682135f32,
+    0.00542849347449f32,
+    0.00475084187141f32,
+    0.00152075842012f32,
+    -0.00137555913794f32,
+    -0.00231875069753f32,
+    -0.00151594548681f32,
+    -0.00017731941968f32,
+    0.000652102959603f32,
+    0.000699405071441f32,
+    0.000313990088076f32,
+    -4.01786368581e-05f32,
+    -0.0001532907693f32,
+    -9.43391178056e-05f32,
+    -1.82125347508e-05f32,
+    3.76687698322e-06f32,
+    -1.34932394668e-19f32,
+];
+
+/// 48kHz microphone words to band-limited 16kHz wake-model input.
+pub struct WakeDownsampler {
+    fir: Fir,
+    phase: u8,
+}
+impl Default for WakeDownsampler {
+    fn default() -> Self {
+        Self {
+            fir: Fir::new(),
+            phase: 0,
+        }
+    }
+}
+impl WakeDownsampler {
+    pub fn push_word(&mut self, word: i32) -> Option<i16> {
+        self.fir.store((word >> 8) as f32 / 256.0);
+        self.phase = (self.phase + 1) % 3;
+        if self.phase != 0 {
+            return None;
+        }
+        Some(pcm16(self.fir.output_with(&WAKE_TAPS)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wake_decimator_count_and_alias_rejection() {
+        fn rms(hz: f64) -> f64 {
+            let mut d = WakeDownsampler::default();
+            let mut energy = 0.0;
+            let mut n = 0;
+            for i in 0..48000 {
+                let word = ((10000.0 * (std::f64::consts::TAU * hz * i as f64 / 48000.0).sin())
+                    as i32)
+                    << 16;
+                if let Some(v) = d.push_word(word) {
+                    if i > 999 {
+                        energy += f64::from(v).powi(2);
+                        n += 1;
+                    }
+                }
+            }
+            (energy / n as f64).sqrt()
+        }
+        let speech = rms(1000.0);
+        assert!((speech / 7071.0 - 1.0).abs() < 0.01);
+        assert!(rms(12000.0) / speech < 0.001);
+        let mut d = WakeDownsampler::default();
+        assert_eq!((0..48000).filter_map(|_| d.push_word(0)).count(), 16000);
+    }
     #[test]
     fn decimation_matches_full_rate_reference() {
         for gain in [1, 8, 32] {

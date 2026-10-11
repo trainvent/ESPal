@@ -3,10 +3,15 @@ mod config;
 mod conversation;
 mod duplex;
 mod network;
+mod standalone;
+mod wake;
 mod websocket;
 
 use esp_idf_svc::{hal::peripherals::Peripherals, nvs::EspDefaultNvsPartition};
-use std::{io::Read, time::Duration};
+use std::{
+    io::Read,
+    time::{Duration, Instant},
+};
 
 fn export_recording(pcm: &[u8]) {
     export_pcm(pcm, "ESPAL_RECORD", 48000, 3);
@@ -48,14 +53,69 @@ fn main() {
     let mut audio = None;
     let mut network = None;
     log::info!("ESPal idle. Commands: help, stats, tone, record, provision, connect, check, turn, pipeline, forget");
-    log::info!(
-        "Credentials configured: {}. No audio or networking at boot",
-        config.is_some()
-    );
+    log::info!("Credentials configured: {}. Standalone boot: {}; USB commands available for five seconds before wake mode", config.is_some(), config.as_ref().is_some_and(|c| c.standalone));
+    // Nonblocking USB input permits autonomous startup with no host attached.
+    unsafe {
+        let mut usb = esp_idf_svc::sys::usb_serial_jtag_driver_config_t {
+            tx_buffer_size: 1024,
+            rx_buffer_size: 2048,
+        };
+        if esp_idf_svc::sys::usb_serial_jtag_driver_install(&mut usb) != esp_idf_svc::sys::ESP_OK {
+            log::error!("USB console driver initialization failed");
+            return;
+        }
+        esp_idf_svc::sys::usb_serial_jtag_vfs_use_driver();
+        let flags = esp_idf_svc::sys::fcntl(0, esp_idf_svc::sys::F_GETFL as i32);
+        if flags < 0
+            || esp_idf_svc::sys::fcntl(
+                0,
+                esp_idf_svc::sys::F_SETFL as i32,
+                flags | esp_idf_svc::sys::O_NONBLOCK as i32,
+            ) < 0
+        {
+            log::error!("Cannot enable nonblocking USB input; standalone startup unavailable");
+            return;
+        }
+    }
+    let boot = Instant::now();
     let mut stdin = std::io::stdin();
     let mut line = Vec::with_capacity(2048);
     let mut overflow = false;
     loop {
+        if boot.elapsed() >= Duration::from_secs(5) && config.as_ref().is_some_and(|c| c.standalone)
+        {
+            let result = (|| -> Result<(), &'static str> {
+                if audio.is_none() {
+                    let (i2s, pins) = hardware
+                        .take()
+                        .ok_or("Audio unavailable for standalone mode")?;
+                    audio = Some(
+                        audio::Diagnostics::new(i2s, pins)
+                            .map_err(|_| "Audio initialization failed")?,
+                    );
+                }
+                if network.is_none() {
+                    network = Some(network::Network::new(
+                        modem
+                            .take()
+                            .ok_or("Network unavailable for standalone mode")?,
+                        partition.clone(),
+                    )?);
+                }
+                standalone::run(
+                    audio.as_mut().unwrap(),
+                    network.as_mut().unwrap(),
+                    config.as_ref().unwrap(),
+                )
+            })();
+            if let Err(e) = result {
+                log::error!("Standalone startup failed: {e}");
+                // Keep USB recovery available rather than spinning on a missing model.
+                if let Some(c) = config.as_mut() {
+                    c.standalone = false;
+                }
+            }
+        }
         let mut byte = [0];
         match stdin.read(&mut byte) {
             Ok(1) if byte[0] == b'\n' || byte[0] == b'\r' => {
@@ -74,6 +134,17 @@ fn main() {
                             }
                             Err(e) => log::error!("Provisioning failed: {e}"),
                         }
+                    } else if let Some(mode) = command.strip_prefix("standalone ") {
+                        match mode {
+                            "on" | "off" => match store.set_standalone(mode == "on") {
+                                Ok(c) => {
+                                    config = Some(c);
+                                    println!("ESPAL_STANDALONE {mode}");
+                                }
+                                Err(e) => log::error!("Standalone setting failed: {e}"),
+                            },
+                            _ => log::error!("Use standalone on or standalone off"),
+                        }
                     } else if let Some(voice) = command.strip_prefix("voice ") {
                         match store.set_voice(voice) {
                             Ok(c) => {
@@ -85,7 +156,7 @@ fn main() {
                     } else {
                         let result = (|| -> Result<(), &'static str> {
                             match command {
-                                "help"=>log::info!("stats, tone, record (5s); connect (Wi-Fi/time); check (OpenAI session); pipeline (filtered tone); turn (5s spoken request); forget"),
+                                "help"=>log::info!("stats, tone, record (5s); connect (Wi-Fi/time); check (OpenAI session); pipeline (filtered tone); turn (speech-ended request); standalone on/off; wake-check; wake-test; forget"),
                                 "forget"=>{store.forget()?;config=None;if let Some(n)=network.as_mut(){network::Network::stop(n);}log::info!("Credentials removed");},
                                 "connect" | "check" | "turn" | "turn-capture"=>{
                                     let c=config.as_ref().ok_or("Run tools/provision.py first")?;
@@ -109,13 +180,28 @@ fn main() {
                                     let (i2s,pins)=hardware.take().ok_or("Reset before the isolated tone test")?;
                                     audio::Diagnostics::tone_tx(i2s,pins,command=="tone-pico").map_err(|e|{log::error!("TX-only tone driver error: {e}");"TX-only tone failed; reset before further audio use"})?;
                                 },
-                                "stats" | "tone" | "record" | "pipeline" | "loopback" | "input-test"=>{
+                                "stats" | "tone" | "record" | "pipeline" | "loopback" | "input-test" | "wake-check" | "wake-test"=>{
                                     if audio.is_none() {
                                         let (i2s,pins)=hardware.take().ok_or("Audio initialization requires restart")?;
                                         audio=Some(audio::Diagnostics::new(i2s,pins).map_err(|_|"Audio initialization failed")?);
                                     }
                                     let driver=audio.as_mut().unwrap();
-                                    if command=="input-test" {
+                                    if command=="wake-check" || command=="wake-test" {
+                                        let mut detector=wake::Detector::new()?;
+                                        if command=="wake-check" {
+                                            for _ in 0..2 {
+                                                for _ in 0..2048 {
+                                                    if detector.push(0)? { return Err("Wake self-check triggered on silence"); }
+                                                }
+                                                detector.reset()?;
+                                            }
+                                        }
+                                        if command=="wake-test" {
+                                            if !driver.wait_for_wake(&mut detector,Instant::now()+Duration::from_secs(30))? { return Err("Wake test timed out"); }
+                                            conversation::ready_chime(driver)?;
+                                        }
+                                        log::info!("Wake diagnostic complete");
+                                    } else if command=="input-test" {
                                         conversation::input_test(driver)?;
                                     } else if command=="loopback" {
                                         driver.loopback()?;

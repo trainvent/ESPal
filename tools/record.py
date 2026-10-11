@@ -11,7 +11,7 @@ import serial
 def capture(port, reply=False):
     marker = b"ESPAL_REPLY" if reply else b"ESPAL_RECORD"
     port.write(b"turn-capture\n" if reply else b"record\n")
-    deadline = time.monotonic() + (180 if reply else 90)
+    deadline = time.monotonic() + (720 if reply else 90)
     data = bytearray()
     header = None
     checksum = 2166136261

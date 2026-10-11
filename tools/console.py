@@ -7,12 +7,18 @@ import serial
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["help", "stats", "tone", "tone16", "tone-pico", "pipeline", "loopback", "input-test", "connect", "check", "turn", "forget", "voice"])
-    parser.add_argument("voice", nargs="?", choices=["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar"])
+    parser.add_argument("command", choices=["help", "stats", "tone", "tone16", "tone-pico", "pipeline", "loopback", "input-test", "wake-check", "wake-test", "standalone", "connect", "check", "turn", "forget", "voice"])
+    parser.add_argument("voice", nargs="?", choices=["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar", "on", "off"])
     parser.add_argument("--port", default="/dev/ttyACM0")
     args = parser.parse_args()
-    if (args.command == "voice") != (args.voice is not None):
-        parser.error("Use voice NAME to change the saved voice")
+    if (args.command in ("voice", "standalone")) != (args.voice is not None):
+        parser.error("Use voice NAME or standalone on/off")
+    if args.command == "voice" and args.voice in ("on", "off"):
+        parser.error("Invalid voice")
+    if args.command == "standalone" and args.voice not in ("on", "off"):
+        parser.error("Use standalone on or standalone off")
+    if args.command == "turn":
+        input("Press Enter when ready. Speak when LISTENING appears: ")
     port = serial.Serial()
     port.port = args.port
     port.baudrate = 115200
@@ -23,16 +29,18 @@ def main():
     try:
         time.sleep(1.5)
         port.reset_input_buffer()
-        if args.command == "turn":
-            input("Press Enter when ready. Speak when LISTENING appears: ")
-        command = f"voice {args.voice}" if args.command == "voice" else args.command
+        command = f"{args.command} {args.voice}" if args.command in ("voice", "standalone") else args.command
         port.write((command + "\n").encode())
         port.flush()
-        deadline = time.monotonic() + (180 if args.command == "turn" else 40)
+        deadline = time.monotonic() + (720 if args.command == "turn" else 40)
         while time.monotonic() < deadline:
             line = port.readline(4096)
             if line:
                 print(line.decode("utf-8", "replace").strip(), flush=True)
+                if args.command == "standalone" and line.strip() == f"ESPAL_STANDALONE {args.voice}".encode():
+                    return
+                if args.command in ("wake-check", "wake-test") and b"Wake diagnostic complete" in line:
+                    return
                 if args.command == "voice" and line.strip() == f"ESPAL_VOICE {args.voice}".encode():
                     return
                 if b"OpenAI session ready;" in line or b"Turn finished;" in line or b"synchronized time ready" in line and args.command == "connect":

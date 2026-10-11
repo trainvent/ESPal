@@ -13,6 +13,7 @@ parser.add_argument("--output", type=Path, default=Path("/home/leonmarq/Dokument
 args = parser.parse_args()
 if args.output.exists():
     parser.error("Output exists; choose another --output filename")
+input("Press Enter when ready; speak when LISTENING appears. Speaker stays silent: ")
 port = serial.Serial()
 port.port, port.baudrate, port.timeout = args.port, 115200, 0.5
 port.dtr = port.rts = False
@@ -20,7 +21,6 @@ port.open()
 try:
     time.sleep(1.5)
     port.reset_input_buffer()
-    input("Press Enter when ready; speak when LISTENING appears. Speaker stays silent: ")
     rate, pcm = capture(port, reply=True)
 finally:
     port.close()
