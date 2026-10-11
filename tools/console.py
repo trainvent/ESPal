@@ -7,7 +7,7 @@ import serial
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["help", "stats", "tone", "tone16", "tone-pico", "pipeline", "loopback", "input-test", "wake-check", "wake-test", "aec-check", "interrupt-check", "standalone", "connect", "check", "turn", "forget", "voice"])
+    parser.add_argument("command", choices=["help", "stats", "tone", "tone16", "tone-pico", "pipeline", "loopback", "input-test", "wake-check", "wake-test", "aec-check", "interrupt-check", "interrupt-network-check", "standalone", "connect", "check", "turn", "forget", "voice"])
     parser.add_argument("voice", nargs="?", choices=["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar", "on", "off"])
     parser.add_argument("--port", default="/dev/ttyACM0")
     args = parser.parse_args()
@@ -32,7 +32,7 @@ def main():
         command = f"{args.command} {args.voice}" if args.command in ("voice", "standalone") else args.command
         port.write((command + "\n").encode())
         port.flush()
-        deadline = time.monotonic() + (720 if args.command == "turn" else 40)
+        deadline = time.monotonic() + (720 if args.command == "turn" else 90 if args.command == "interrupt-network-check" else 40)
         while time.monotonic() < deadline:
             line = port.readline(4096)
             if line:
@@ -40,6 +40,8 @@ def main():
                 if args.command == "turn" and b"Reply interrupted:" in line:
                     return
                 if args.command == "standalone" and line.strip() == f"ESPAL_STANDALONE {args.voice}".encode():
+                    return
+                if args.command == "interrupt-network-check" and b"Network interruption diagnostic complete" in line:
                     return
                 if args.command == "interrupt-check" and b"Interruption diagnostic complete" in line:
                     return
@@ -49,7 +51,9 @@ def main():
                     return
                 if args.command == "voice" and line.strip() == f"ESPAL_VOICE {args.voice}".encode():
                     return
-                if b"OpenAI session ready;" in line or b"Turn finished;" in line or b"synchronized time ready" in line and args.command == "connect":
+                if (b"OpenAI session ready;" in line and args.command == "check"
+                        or b"Turn finished;" in line and args.command == "turn"
+                        or b"synchronized time ready" in line and args.command == "connect"):
                     return
                 if b"espal:" in line and b"E (" in line:
                     return

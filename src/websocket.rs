@@ -1,4 +1,3 @@
-use crate::config::Config;
 use esp_idf_svc::{hal::delay::TickType, sys::*};
 use espal_core::realtime::Assembler;
 use std::{
@@ -106,13 +105,13 @@ pub struct Socket {
     _headers: CString,
 }
 impl Socket {
-    pub fn connect(c: &Config) -> Result<Self, &'static str> {
+    pub fn connect(model: &str, api_key: &str) -> Result<Self, &'static str> {
         let uri = CString::new(format!(
             "wss://api.openai.com/v1/realtime?model={}",
-            c.model
+            model
         ))
         .map_err(|_| "Invalid URL")?;
-        let headers = CString::new(format!("Authorization: Bearer {}\r\n", c.api_key))
+        let headers = CString::new(format!("Authorization: Bearer {}\r\n", api_key))
             .map_err(|_| "Invalid authentication header")?;
         let (sender, receiver) = mpsc::sync_channel(256);
         let context = Box::new(Context {
@@ -126,13 +125,15 @@ impl Socket {
             disable_auto_reconnect: true,
             buffer_size: 4096,
             task_stack: 8192,
-            task_prio: 5,
+            // Software TLS must yield to speaker conversion and wake inference.
+            task_prio: 4,
             transport: esp_websocket_transport_t_WEBSOCKET_TRANSPORT_OVER_SSL,
             crt_bundle_attach: Some(esp_crt_bundle_attach),
             skip_cert_common_name_check: false,
             network_timeout_ms: 15000,
             ping_interval_sec: 15,
-            pingpong_timeout_sec: 10,
+            // Allow control frames to catch up during audio/TLS processing bursts.
+            pingpong_timeout_sec: 30,
             ..Default::default()
         };
         let handle = unsafe { esp_websocket_client_init(&config) };
@@ -177,6 +178,11 @@ impl Socket {
         }
         Ok(socket)
     }
+    #[inline(never)]
+    pub fn append_audio(&mut self, pcm: &[u8]) -> Result<(), &'static str> {
+        self.send(&espal_core::realtime::append(pcm))
+    }
+    #[inline(never)]
     pub fn send(&mut self, event: &serde_json::Value) -> Result<(), &'static str> {
         let json = event.to_string();
         if json.len() > espal_core::realtime::MAX_MESSAGE {

@@ -13,6 +13,39 @@ use std::{
     time::{Duration, Instant},
 };
 
+struct AudioPriority(esp_idf_svc::sys::UBaseType_t);
+struct SpeakerScheduling(esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration);
+impl SpeakerScheduling {
+    fn acquire() -> Result<Self, &'static str> {
+        use esp_idf_svc::hal::{cpu::Core, task::thread::ThreadSpawnConfiguration};
+        let previous = ThreadSpawnConfiguration::get().unwrap_or_default();
+        ThreadSpawnConfiguration {
+            pin_to_core: Some(Core::Core0),
+            priority: 5,
+            ..ThreadSpawnConfiguration::default()
+        }.set().map_err(|_| "Speaker scheduling configuration failed")?;
+        Ok(Self(previous))
+    }
+}
+impl Drop for SpeakerScheduling {
+    fn drop(&mut self) { let _ = self.0.set(); }
+}
+impl AudioPriority {
+    fn acquire() -> Self {
+        Self::with_priority(5)
+    }
+    fn with_priority(priority: esp_idf_svc::sys::UBaseType_t) -> Self {
+        let original = unsafe { esp_idf_svc::sys::uxTaskPriorityGet(std::ptr::null_mut()) };
+        unsafe { esp_idf_svc::sys::vTaskPrioritySet(std::ptr::null_mut(), original.max(priority)) };
+        Self(original)
+    }
+}
+impl Drop for AudioPriority {
+    fn drop(&mut self) {
+        unsafe { esp_idf_svc::sys::vTaskPrioritySet(std::ptr::null_mut(), self.0) };
+    }
+}
+
 fn check_error(event: &serde_json::Value) -> Result<(), &'static str> {
     // Do not log server error text: it can include user data or credentials.
     if event["type"] == "error" {
@@ -30,11 +63,52 @@ pub fn interruption_test(audio: &mut Diagnostics) -> Result<(), &'static str> {
     log::info!("Interruption diagnostic complete");
     Ok(())
 }
+pub fn interruption_network_test(
+    audio: &mut Diagnostics,
+    config: &Config,
+) -> Result<(), &'static str> {
+    let mut socket = open_session(config, Instant::now() + Duration::from_secs(60))?;
+    // Cover the capture/filter/upload closure used after the standalone chime.
+    // Discard this diagnostic input before requesting the fixed spoken reply.
+    stream_input(audio, config.mic_gain, false, Instant::now() + Duration::from_secs(20), &mut |chunk| {
+        socket.append_audio(chunk)
+    })?;
+    socket.send(&json!({"type":"input_audio_buffer.clear"}))?;
+    log::info!("Network microphone upload diagnostic complete");
+    interruption_test(audio)?;
+    // Prove the live TLS connection remains usable after concurrent processing.
+    socket.send(&realtime::session_update(
+        &config.voice,
+        &config.instructions,
+    ))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = socket.receive(deadline)?;
+        check_error(&event)?;
+        if event["type"] == "session.updated" {
+            break;
+        }
+    }
+    // Exercise real incoming audio and a second AEC initialization on the same
+    // TLS connection. Send a fixed text prompt; no microphone upload occurs.
+    let _idle_detector = espal_audio::wake::Detector::new()?;
+    socket.send(&json!({"type":"conversation.item.create", "item":{
+        "type":"message", "role":"user", "content":[{
+            "type":"input_text", "text":"Count aloud from one to twenty at a natural pace, without any introduction."
+        }]
+    }}))?;
+    socket.send(&json!({"type":"response.create"}))?;
+    if play_response(audio, &mut socket, Instant::now() + Duration::from_secs(45))? {
+        return Err("Network diagnostic reply was interrupted");
+    }
+    log::info!("Network interruption diagnostic complete");
+    Ok(())
+}
 fn pipeline_duration(audio: &mut Diagnostics, seconds: f32) -> Result<(), &'static str> {
     // Retain an idle detector while the playback detector comes and goes,
     // exercising the shared ESP-SR model registry used in standalone mode.
-    let mut idle_detector = crate::wake::Detector::new()?;
-    let interruption = crate::interruption::Signals::default();
+    let mut idle_detector = espal_audio::wake::Detector::new()?;
+    let interruption = espal_audio::interruption::Signals::default();
     let mut down = Downsampler::new(1);
     let count = (seconds * 48000.0) as usize;
     let mut pcm = Vec::with_capacity(count);
@@ -58,13 +132,29 @@ fn pipeline_duration(audio: &mut Diagnostics, seconds: f32) -> Result<(), &'stat
     sender
         .send(Playback::End)
         .map_err(|_| "Pipeline queue failed")?;
-    audio.playback_interruptible(
-        receiver,
-        &queued,
-        &cancel,
-        Instant::now() + Duration::from_secs(30),
-        Some(&interruption),
-    )?;
+    // Match the real response path: DMA servicing must run at audio-task
+    // priority, rather than the low-priority USB command/main task.
+    let _speaker_scheduling = SpeakerScheduling::acquire()?;
+    std::thread::scope(|scope| {
+        let queued_ref = &queued;
+        let cancel_ref = &cancel;
+        let interruption_ref = &interruption;
+        std::thread::Builder::new()
+            .name("speaker-test".into())
+            .stack_size(8192)
+            .spawn_scoped(scope, move || {
+                audio.playback_interruptible(
+                    receiver,
+                    queued_ref,
+                    cancel_ref,
+                    Instant::now() + Duration::from_secs(30),
+                    Some(interruption_ref),
+                )
+            })
+            .map_err(|_| "Diagnostic speaker task failed")?
+            .join()
+            .map_err(|_| "Diagnostic speaker task panicked")?
+    })?;
     if queued.load(Ordering::Acquire) != 0 {
         return Err("Pipeline did not drain");
     }
@@ -81,12 +171,13 @@ fn pipeline_duration(audio: &mut Diagnostics, seconds: f32) -> Result<(), &'stat
     Ok(())
 }
 
-fn open_session(config: &Config, deadline: Instant) -> Result<Socket, &'static str> {
+fn open_session(config: &Config, deadline: Instant) -> Result<Box<Socket>, &'static str> {
     log::info!("Connecting OpenAI with certificate validation");
-    let mut socket = Socket::connect(config)?;
+    let mut socket = Box::new(Socket::connect(&config.model, &config.api_key)?);
+    let instructions = format!("{}\nYour name is Jarvis. When asked your name, identify yourself as Jarvis. Cedar is your voice setting, not your name.", config.instructions);
     socket.send(&realtime::session_update(
         &config.voice,
-        &config.instructions,
+        &instructions,
     ))?;
     loop {
         let event = socket.receive(deadline)?;
@@ -106,25 +197,18 @@ pub fn check(config: &Config) -> Result<(), &'static str> {
 
 /// Keep capture, filtering and upload independent. Both queues hold at most
 /// two seconds; overflow cancels the input instead of dropping speech.
+#[inline(never)]
 fn stream_input(
     audio: &mut Diagnostics,
     gain: u8,
     speech: bool,
     deadline: Instant,
-    mut upload: impl FnMut(&[u8]) -> Result<(), &'static str>,
+    upload: &mut dyn FnMut(&[u8]) -> Result<(), &'static str>,
 ) -> Result<(), &'static str> {
     // app_main runs at priority 1, whereas Rust worker threads default to 5.
     // Give the uploader equal scheduling priority while this pipeline runs;
     // restore its original priority on every exit path.
-    struct UploadPriority(esp_idf_svc::sys::UBaseType_t);
-    impl Drop for UploadPriority {
-        fn drop(&mut self) {
-            unsafe { esp_idf_svc::sys::vTaskPrioritySet(std::ptr::null_mut(), self.0) };
-        }
-    }
-    let original_priority = unsafe { esp_idf_svc::sys::uxTaskPriorityGet(std::ptr::null_mut()) };
-    let _priority = UploadPriority(original_priority);
-    unsafe { esp_idf_svc::sys::vTaskPrioritySet(std::ptr::null_mut(), original_priority.max(5)) };
+    let _priority = AudioPriority::acquire();
     // Keep the continuous capture/filter workers off Wi-Fi's core. Long
     // utterances cannot rely on accumulating a growing processing backlog.
     use esp_idf_svc::hal::{cpu::Core, task::thread::ThreadSpawnConfiguration};
@@ -288,7 +372,7 @@ pub fn input_test(audio: &mut Diagnostics) -> Result<(), &'static str> {
         1,
         false,
         Instant::now() + Duration::from_secs(20),
-        |_| {
+        &mut |_| {
             std::thread::sleep(Duration::from_millis(120));
             Ok(())
         },
@@ -298,7 +382,7 @@ pub fn input_test(audio: &mut Diagnostics) -> Result<(), &'static str> {
         1,
         false,
         Instant::now() + Duration::from_secs(5),
-        |_| Err("Injected upload failure"),
+        &mut |_| Err("Injected upload failure"),
     );
     if failure != Err("Injected upload failure") {
         return Err("Input cancellation test failed");
@@ -310,11 +394,11 @@ pub fn input_test(audio: &mut Diagnostics) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn request(audio: &mut Diagnostics, config: &Config) -> Result<(Socket, Instant), &'static str> {
+fn request(audio: &mut Diagnostics, config: &Config) -> Result<(Box<Socket>, Instant), &'static str> {
     let deadline = Instant::now() + Duration::from_secs(660);
     let mut socket = open_session(config, deadline)?;
-    stream_input(audio, config.mic_gain, true, deadline, |chunk| {
-        socket.send(&realtime::append(chunk))
+    stream_input(audio, config.mic_gain, true, deadline, &mut |chunk| {
+        socket.append_audio(chunk)
     })?;
     socket.send(&json!({"type":"input_audio_buffer.commit"}))?;
     socket.send(&json!({"type":"response.create"}))?;
@@ -380,8 +464,8 @@ pub fn session(audio: &mut Diagnostics, config: &Config) -> Result<(), &'static 
     ready_chime(audio)?;
     log::info!("Conversation ready; speak after the beep");
     while Instant::now() < deadline {
-        let input = stream_input(audio, config.mic_gain, true, deadline, |chunk| {
-            socket.send(&realtime::append(chunk))
+        let input = stream_input(audio, config.mic_gain, true, deadline, &mut |chunk| {
+            socket.append_audio(chunk)
         });
         if input == Err("No speech detected") {
             log::info!("Conversation idle; returning to offline wake detection");
@@ -403,6 +487,8 @@ fn play_response(
     socket: &mut Socket,
     deadline: Instant,
 ) -> Result<bool, &'static str> {
+    // Wake detection takes precedence over parsing buffered response events.
+    let _priority = AudioPriority::with_priority(4);
     log::info!("Waiting for spoken response; microphone upload gated");
     // Generation can outrun the speaker for an entire long answer. Budget the
     // pending PCM against currently available PSRAM, after the wake model and
@@ -424,10 +510,12 @@ fn play_response(
     let cancel = AtomicBool::new(false);
     let mut received_bytes = 0usize;
     let mut max_queued = 0usize;
-    let interruption = crate::interruption::Signals::default();
+    let interruption = espal_audio::interruption::Signals::default();
     let mut response_done = false;
     let mut item_id: Option<String> = None;
     let mut content_index = 0usize;
+    let mut yield_bytes = 0usize;
+    let _speaker_scheduling = SpeakerScheduling::acquire()?;
     let result = std::thread::scope(|scope| {
         let queued_ref = &queued;
         let cancel_ref = &cancel;
@@ -474,6 +562,11 @@ fn play_response(
                 if sender.try_send(Playback::Audio(bytes)).is_err() {
                     queued.fetch_sub(len, Ordering::AcqRel);
                     return Err("Playback queue overflow; response cancelled");
+                }
+                yield_bytes += len;
+                if yield_bytes >= 48000 {
+                    std::thread::sleep(Duration::from_millis(10));
+                    yield_bytes = 0;
                 }
             }
             if event["type"] == "response.done" {

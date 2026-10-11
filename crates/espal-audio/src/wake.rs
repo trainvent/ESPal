@@ -56,6 +56,9 @@ impl Detector {
             if detector.data.is_null() {
                 return Err("Wake model allocation failed");
             }
+            if iface.set_det_threshold.ok_or("Wake threshold unavailable")?(detector.data, 0.55, 1) != 1 {
+                return Err("Wake threshold setting failed");
+            }
             let rate = iface.get_samp_rate.ok_or("Wake sample rate unavailable")?(detector.data);
             let channels = iface.get_channel_num.ok_or("Wake channels unavailable")?(detector.data);
             let chunk = iface
@@ -86,12 +89,19 @@ impl Detector {
             if self.data.is_null() {
                 return Err("Wake model restart failed");
             }
+            unsafe {
+                if (*self.iface).set_det_threshold.ok_or("Wake threshold unavailable")?(self.data, 0.55, 1) != 1 {
+                    return Err("Wake threshold setting failed");
+                }
+            }
             self.used = false;
         }
         Ok(())
     }
     pub fn push(&mut self, sample: i16) -> Result<bool, &'static str> {
-        self.buffer.push(sample);
+        // The ICS43434 signal is quiet at native PCM16 scale. Apply fixed gain
+        // only at WakeNet input, after AEC when playing, with saturation.
+        self.buffer.push((i32::from(sample) * 16).clamp(i16::MIN as i32, i16::MAX as i32) as i16);
         if self.buffer.len() < self.chunk {
             return Ok(false);
         }

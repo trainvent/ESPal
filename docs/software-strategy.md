@@ -86,9 +86,29 @@ WakeNet. The post-volume speaker reference is delayed by the 80ms TX DMA
 preload. Detection stops DMA, cancels unfinished response generation, and
 truncates the assistant item to the played duration before another ready beep.
 Wake-model flash mappings are shared for the firmware lifetime because the
-library caches a global registry. AEC/WakeNet runs on core 0; reconstruction
-runs on core 1, with CPU frequency set to 240MHz. Microphone audio during
+library caches a global registry. WakeNet runs on core 0; AEC and reconstruction
+run as separate tasks on core 1. Microphone/reference decimation runs beside
+DMA servicing. CPU frequency is set to 240MHz. Microphone audio during
 playback stays local. Natural speech interruption is not enabled yet.
+
+A live reply exposed AEC backlog beyond the original 400ms queue: playback
+stopped and the session returned to wake mode without a reboot or a detected
+interruption. AEC now runs at priority 6, ahead of the reply converter, with
+an 800ms queue. If this queue fills, the detector disconnects for that reply
+and logs the limitation; speaker audio continues without losing PCM samples.
+The same fallback applies to wake-processing errors: these no longer set the
+shared playback cancellation flag. Only a detected wake word cancels playback.
+Local wake/AEC decimation now uses a 31-tap Blackman filter with Q15 integer
+coefficients and an i64 accumulator to reduce CPU load;
+the cloud-input converter retains its 63 taps. Existing count and alias-rejection
+tests pass. Under heavy load, interruption can be unavailable for that reply.
+The combined diagnostic now requests a longer spoken count from one to twenty.
+Speaker servicing is pinned to core 0 at priority 5 alongside networking and
+WakeNet; AEC runs at priority 6 on core 1. Wake microphone/reference filtering
+also runs on core 1. Speaker rate conversion uses linear 24→48kHz interpolation
+to reduce contention with AEC; filtered 48→24kHz microphone upload is retained.
+Prepared audio is capped at one second with 600ms priming. Raising speaker
+priority to 7 instead starved networking and is not retained.
 
 On-device synthetic 10ms echo-delay testing measured 19.8dB suppression.
 Twelve seconds of quiet playback with simultaneous AEC/WakeNet completed with
@@ -97,6 +117,67 @@ backlog in the final run, with no watchdog warnings. Both detector instances
 remained reusable. Live overlapping speech,
 echo rejection at normal speaker volume, and API cancellation/truncation still
 need user acceptance testing.
+
+The first live attempt exposed internal-heap exhaustion while Wi-Fi/TLS and
+AEC were active, causing a Wi-Fi PHY timer allocation abort. TLS now allocates
+in PSRAM, default allocations larger than 1KiB prefer PSRAM, and the internal
+reserve is 64KiB. Echo startup requires at least 32KiB of free internal RAM.
+Splitting AEC and WakeNet into independent tasks also fixes processing queue
+overruns found when testing normal-speed playback with a connected network.
+The `espal-audio` and `espal-core` crates use speed optimization, while the
+session/upload firmware keeps its tested size optimization. Whole-firmware
+levels 2 and 3 reproducibly corrupted the upload closure on this Xtensa toolchain;
+separating audio processing preserves its speed without applying those settings
+to session code. The diagnostic now covers that microphone-upload path.
+Incoming response parsing runs at priority 4, below speaker and WakeNet priority
+5, and restores its prior priority on exit. Cleaned wake audio has a 64-frame
+(2.048-second) queue to absorb response bursts. AEC creation temporarily prefers
+internal RAM for allocations below 16KiB; subsequent allocations restore the
+1KiB threshold. The main task has a 16KiB stack.
+
+The latest longer network diagnostic completed 19.760 seconds of spoken playback
+with zero preparation gaps and wake detection active throughout. Maximum wake
+backlog was 40ms and AEC backlog was 131ms; no fallback, reboot or watchdog warning
+occurred. Physical interruption acceptance remains pending.
+
+The combined network test kept over 100KiB of internal RAM free, played twelve
+seconds in 12.520 seconds including the acoustic tail, and completed a real
+OpenAI reply to a fixed text prompt. The diagnostic now also uploads five
+seconds of microphone audio and clears it before the fixed prompt. Both playback phases
+reported zero preparation gaps and no false wake trigger, reboot or watchdog
+warning. With the split audio crate, microphone upload also completed in
+5.081 seconds for a five-second recording. Maximum AEC backlog was 203ms;
+cleaned-audio wake backlog was 26ms across the two playback phases.
+The first physical interruption test succeeded: Jarvis was detected during
+playback, 2.480 seconds of played audio were retained in history, cancellation
+and truncation completed, and the ready beep led into another captured request.
+The following 30.960-second reply completed without playback gaps; after 15
+seconds without speech the session returned to offline WAKE READY. No crash or
+reboot occurred in that run. Recognition remains inconsistent and needs tuning;
+this validates the cancellation path, not reliable detection at every distance.
+Subsequent live testing showed very quiet WakeNet input (roughly 100–230 PCM16
+RMS during attempted wake speech). The detector now applies fixed 16× saturated
+gain to both idle and echo-cancelled input; cloud input and speaker gain are
+unchanged. Another long reply failed in ESP-IDF's hardware AES DMA scratch-buffer
+allocation and returned safely to wake mode. Hardware AES is now disabled so TLS
+uses software AES without that DMA allocation. Physical sensitivity and repeated
+long-turn stability require renewed acceptance testing.
+With software AES, the combined diagnostic completed with wake detection active
+and no TLS allocation failure, but reported 40 brief preparation gaps over a
+20.860-second playback; the user heard a slight lag on six. Increasing prepared
+capacity to two seconds and priming to one second did not eliminate the gaps.
+Playback smoothness under this configuration remains unresolved.
+Lowering the WebSocket worker to priority 4 subsequently completed the combined
+test with zero preparation gaps over 19.920 seconds of playback, no detector
+fallback or TLS error, 42ms maximum WakeNet backlog and 123ms AEC backlog.
+The stronger wake-input gain is retained. Repeated live turns remain the next
+stability check; this single diagnostic does not establish long-session stability.
+The next live failure was a WebSocket PONG timeout (10 seconds), not a reboot;
+the firmware recovered to offline wake mode. PONG timeout is now 30 seconds to
+tolerate processing bursts. WakeNet's Jarvis threshold is explicitly 0.55 for
+new and restarted instances, retaining saturated 16× input gain. Session
+instructions explicitly name the assistant Jarvis while retaining Cedar voice.
+Sensitivity, false wakes and repeated-session keepalive still need live testing.
 
 USB, microphone recording, Wi-Fi/SNTP, certificate-validated OpenAI sessions,
 and clean physical speaker playback are verified. Both input and output now
@@ -113,7 +194,14 @@ turns reuse the same OpenAI session; 15 seconds without new speech returns to
 local wake mode. Ten minutes is the continuous-input ceiling and eleven minutes
 the conversation deadline. Playback gates microphone upload through its 500ms
 acoustic tail. The speech endpoint uses adaptive energy thresholds, not semantic
-VAD or acoustic echo cancellation, so quiet speech and noisy rooms need testing.
+recognition. Quiet speech after the ready beep previously fell below the 180
+PCM16 RMS minimum. The floor is now 60, initial noise estimate 20, and minimum
+noise estimate 4, matching the measured microphone levels. A regression test
+verifies 100-RMS speech starts after three 50ms blocks and ends after 1.2 seconds
+of quiet; all 16 core tests pass. Physical onset acceptance remains pending.
+
+Quiet speech and noisy rooms still need physical testing; input endpointing is
+separate from the echo cancellation used for playback interruption.
 
 ESP-SR 2.0.5 supplies the offline 16kHz Jarvis model. A separate filtered
 48→16kHz decimator feeds it; idle audio stays local. The model partition starts
@@ -232,7 +320,7 @@ remains outstanding. Live clean-speech acceptance is still pending.
 
 Prepared speech still sounded distorted. Source inspection revealed HAL 0.47.0
 initializes RX before TX; ESP-IDF 5.5.5 assigns the second channel the duplex
-slave role. A small owned ESP-IDF wrapper (`src/duplex.rs`) now initializes TX
+slave role. A small owned ESP-IDF wrapper (`crates/espal-audio/src/duplex.rs`) now initializes TX
 first, preserving identical shared 48kHz/32-bit Philips framing. Device channel
 info confirms TX master (0), RX slave (1), BCLK 3,072,000Hz. Signed stereo
 loopback passes with 20,160 matched frames, zero invalid frames and zero gaps.

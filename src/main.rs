@@ -1,11 +1,8 @@
-mod audio;
+use espal_audio::{audio, interruption, wake};
 mod config;
 mod conversation;
-mod duplex;
-mod interruption;
 mod network;
 mod standalone;
-mod wake;
 mod websocket;
 
 use esp_idf_svc::{hal::peripherals::Peripherals, nvs::EspDefaultNvsPartition};
@@ -159,19 +156,21 @@ fn main() {
                             match command {
                                 "help"=>log::info!("stats, tone, record (5s); connect (Wi-Fi/time); check (OpenAI session); pipeline (filtered tone); turn (speech-ended request); standalone on/off; wake-check; wake-test; forget"),
                                 "forget"=>{store.forget()?;config=None;if let Some(n)=network.as_mut(){network::Network::stop(n);}log::info!("Credentials removed");},
-                                "connect" | "check" | "turn" | "turn-capture"=>{
+                                "connect" | "check" | "turn" | "turn-capture" | "interrupt-network-check"=>{
                                     let c=config.as_ref().ok_or("Run tools/provision.py first")?;
                                     if network.is_none() {
                                         network=Some(network::Network::new(modem.take().ok_or("Network initialization requires restart")?,partition.clone())?);
                                     }
                                     network.as_mut().unwrap().connect(c)?;
                                     if command=="check" { conversation::check(c)?; }
-                                    if command=="turn" || command=="turn-capture" {
+                                    if command=="turn" || command=="turn-capture" || command=="interrupt-network-check" {
                                         if audio.is_none() {
                                             let (i2s,pins)=hardware.take().ok_or("Audio initialization requires restart")?;
                                             audio=Some(audio::Diagnostics::new(i2s,pins).map_err(|_|"Audio initialization failed")?);
                                         }
-                                        if command=="turn-capture" {
+                                        if command=="interrupt-network-check" {
+                                            conversation::interruption_network_test(audio.as_mut().unwrap(),c)?;
+                                        } else if command=="turn-capture" {
                                             let pcm=conversation::capture_reply(audio.as_mut().unwrap(),c)?;
                                             export_pcm(&pcm,"ESPAL_REPLY",24000,2);
                                         } else { conversation::turn(audio.as_mut().unwrap(),c)?; }

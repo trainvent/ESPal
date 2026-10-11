@@ -19,7 +19,7 @@ const RATE: u32 = 48_000;
 const FRAMES: usize = 240;
 // 80ms of hardware buffering covers the measured Wi-Fi scheduling stalls.
 const DMA_BUFFERS: usize = 16;
-const PLAYBACK_PRIME_BLOCKS: usize = 30; // 600ms of prepared audio.
+const PLAYBACK_PRIME_BLOCKS: usize = 50; // One second of prepared audio.
                                          // User-selected speaker level: -12dB relative to received PCM.
 const SPEAKER_DIVISOR: i32 = 4;
 
@@ -55,8 +55,19 @@ impl Diagnostics {
         deadline: Instant,
         interruption: Option<&crate::interruption::Signals>,
     ) -> Result<(), &'static str> {
+        // DMA servicing must preempt the optional detector and converter.
+        // Restore the caller's priority for chimes and diagnostic invocations.
+        struct RestorePriority(esp_idf_svc::sys::UBaseType_t);
+        impl Drop for RestorePriority {
+            fn drop(&mut self) {
+                unsafe { esp_idf_svc::sys::vTaskPrioritySet(core::ptr::null_mut(), self.0) };
+            }
+        }
+        let previous = unsafe { esp_idf_svc::sys::uxTaskPriorityGet(core::ptr::null_mut()) };
+        let _priority = RestorePriority(previous);
+        unsafe { esp_idf_svc::sys::vTaskPrioritySet(core::ptr::null_mut(), previous.max(5)) };
         // Conversion runs independently of DMA servicing. Bound the prepared
-        // queue to two seconds, and prime 600ms before starting the clocks.
+        // queue to two seconds, and prime one second before starting the clocks.
         // Keep the FIR worker away from the Wi-Fi task pinned to core 0.
         use esp_idf_svc::hal::{cpu::Core, task::thread::ThreadSpawnConfiguration};
         struct RestoreSpawnConfig(ThreadSpawnConfiguration);
@@ -73,13 +84,14 @@ impl Diagnostics {
         .set()
         .map_err(|_| "Reply filter scheduling configuration failed")?;
         std::thread::scope(|scope| {
-            let (monitor_sender, monitor_receiver) = std::sync::mpsc::sync_channel(20);
+            let (monitor_sender, monitor_receiver) = std::sync::mpsc::sync_channel(40);
             let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
             let monitor = if let Some(signals) = interruption {
-                // Split AEC/WakeNet and reconstruction across the two cores.
-                // Wi-Fi shares core 0, so the detector yields regularly.
+                // Decimation runs beside DMA on core 0; move AEC/WakeNet away
+                // from Wi-Fi. Both DSP workers on core 1 yield regularly.
                 ThreadSpawnConfiguration {
-                    pin_to_core: Some(Core::Core0),
+                    pin_to_core: Some(Core::Core1),
+                    priority: 6,
                     ..ThreadSpawnConfiguration::default()
                 }
                 .set()
@@ -108,10 +120,17 @@ impl Diagnostics {
             .set()
             .map_err(|_| "Reply filter scheduling configuration failed")?;
             let monitor_sender = if monitor.is_some() {
-                ready_receiver
-                    .recv()
-                    .map_err(|_| "Interruption initialization task stopped")??;
-                Some(monitor_sender)
+                match ready_receiver.recv() {
+                    Ok(Ok(())) => Some(monitor_sender),
+                    Ok(Err(error)) => {
+                        log::warn!("Interruption initialization unavailable: {error}; playback continues");
+                        None
+                    }
+                    Err(_) => {
+                        log::warn!("Interruption initialization task stopped; playback continues");
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -121,7 +140,7 @@ impl Diagnostics {
                 .stack_size(8192)
                 .spawn_scoped(scope, move || {
                     log::info!("Reply filter: core={:?}", esp_idf_svc::hal::cpu::core());
-                    let mut filter = espal_core::dsp::Upsampler::new();
+                    let mut previous_sample = 0i16;
                     let mut output = Vec::with_capacity(960 * 8);
                     let mut samples = 0usize;
                     let mut peak = 0i32;
@@ -138,12 +157,13 @@ impl Diagnostics {
                                     let sample = i16::from_le_bytes([bytes[0], bytes[1]]);
                                     samples += 1;
                                     peak = peak.max(i32::from(sample).abs());
-                                    for value in filter.push(sample) {
+                                    for value in [previous_sample, ((i32::from(previous_sample) + i32::from(sample)) / 2) as i16] {
                                         let word = ((i32::from(value) / SPEAKER_DIVISOR) << 16)
                                             .to_le_bytes();
                                         output.extend_from_slice(&word);
                                         output.extend_from_slice(&word);
                                     }
+                                    previous_sample = sample;
                                     if output.len() == 960 * 8 {
                                         max_conversion_us =
                                             max_conversion_us.max(converting.elapsed().as_micros());
@@ -179,7 +199,8 @@ impl Diagnostics {
                     }
                     // Flush the reconstruction filter before padding the last frame.
                     for _ in 0..63 {
-                        for value in filter.push(0) {
+                        for value in [previous_sample, previous_sample / 2] {
+                            previous_sample = 0;
                             let word = ((i32::from(value) / SPEAKER_DIVISOR) << 16).to_le_bytes();
                             output.extend_from_slice(&word);
                             output.extend_from_slice(&word);
@@ -209,7 +230,7 @@ impl Diagnostics {
                 &prepared,
                 cancel,
                 deadline,
-                monitor_sender.as_ref(),
+                monitor_sender,
                 interruption,
             );
             if played.is_err() {
@@ -217,14 +238,15 @@ impl Diagnostics {
             }
             // Unblock a converter waiting on a full queue after DMA failure.
             drop(prepared);
-            drop(monitor_sender);
             let monitored = if let Some(worker) = monitor {
                 worker.join().map_err(|_| "Interruption task panicked")?
             } else {
                 Ok(())
             };
             let converted = converter.join().map_err(|_| "Reply filter task panicked")?;
-            monitored?;
+            if let Err(error) = monitored {
+                log::warn!("Interruption disabled for this reply: {error}");
+            }
             match (played, converted) {
                 (Err(e), _) => Err(e),
                 (_, Err(e)) => Err(e),
@@ -241,7 +263,7 @@ impl Diagnostics {
         prepared: &Receiver<Playback>,
         cancel: &AtomicBool,
         deadline: Instant,
-        monitor: Option<&std::sync::mpsc::SyncSender<crate::interruption::Frame>>,
+        mut monitor: Option<std::sync::mpsc::SyncSender<crate::interruption::Frame>>,
         interruption: Option<&crate::interruption::Signals>,
     ) -> Result<(), &'static str> {
         let waiting = Instant::now();
@@ -335,14 +357,15 @@ impl Diagnostics {
                         Ordering::Release,
                     );
                 }
-                if let Some(monitor) = monitor {
+                if let Some(sender) = monitor.as_ref() {
+                    let captured_at = Instant::now();
                     reference_delay.extend(
                         output
                             .chunks_exact(8)
                             .map(|f| i32::from_le_bytes(f[..4].try_into().unwrap())),
                     );
                     let frame = crate::interruption::Frame {
-                        captured_at: Instant::now(),
+                        captured_at,
                         microphone: input
                             .chunks_exact(8)
                             .map(|f| i32::from_le_bytes(f[..4].try_into().unwrap()))
@@ -351,10 +374,11 @@ impl Diagnostics {
                             .map(|_| reference_delay.pop_front().unwrap())
                             .collect(),
                     };
-                    // Missing microphone/reference frames invalidate AEC timing.
-                    // Stop explicitly rather than silently losing synchronization.
-                    if monitor.try_send(frame).is_err() {
-                        return Err("Echo cancellation fell behind playback");
+                    // A missing frame invalidates AEC alignment. Disconnect this
+                    // detector for the reply, while preserving speaker playback.
+                    if sender.try_send(frame).is_err() {
+                        log::warn!("Interruption unavailable for this reply: echo processing fell behind; playback continues");
+                        monitor.take();
                     }
                 }
             }
@@ -710,6 +734,8 @@ impl Diagnostics {
             let mut input = [0u8; FRAMES * 8];
             let timeout = TickType::new_millis(100).ticks();
             let mut samples = 0usize;
+            let mut wake_energy = 0u64;
+            let mut wake_samples = 0usize;
             while Instant::now() < deadline {
                 let n = self
                     .driver
@@ -721,12 +747,20 @@ impl Diagnostics {
                 for frame in input[..n].chunks_exact(8) {
                     let word = i32::from_le_bytes(frame[..4].try_into().unwrap());
                     if let Some(sample) = filter.push_word(word) {
+                        wake_energy += (i64::from(sample) * i64::from(sample)) as u64;
+                        wake_samples += 1;
                         if detector.push(sample)? {
                             log::info!("WAKE DETECTED: Jarvis");
                             return Ok(true);
                         }
                     }
                     samples += 1;
+                }
+                if wake_samples >= 16000 {
+                    log::info!("Idle wake signal: rms={} samples={wake_samples}",
+                        ((wake_energy / wake_samples as u64) as f32).sqrt() as u32);
+                    wake_energy = 0;
+                    wake_samples = 0;
                 }
                 if samples % 4800 == 0 {
                     std::thread::sleep(Duration::from_millis(10));

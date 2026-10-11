@@ -1,0 +1,9 @@
+[package]
+name = "espal-audio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+esp-idf-svc = "=0.53.0"
+espal-core = { path = "../espal-core" }
+log = "0.4"

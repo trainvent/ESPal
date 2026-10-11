@@ -85,7 +85,7 @@ impl Fir {
     fn output(&self) -> f32 {
         self.output_with(&TAPS)
     }
-    fn output_with(&self, taps: &[f32; 63]) -> f32 {
+    fn output_with<const N: usize>(&self, taps: &[f32; N]) -> f32 {
         let mut result = 0.0;
         let mut index = if self.cursor == 0 {
             62
@@ -126,6 +126,7 @@ impl Downsampler {
     }
     /// Left-aligned signed PCM24 from the mic -> filtered 24kHz PCM16.
     /// Maintain this object across DMA/chunk boundaries; reset between turns.
+    #[inline(never)]
     pub fn push_word(&mut self, word: i32) -> Option<i16> {
         self.fir.store((word >> 8) as f32 * self.gain / 256.0);
         self.phase = !self.phase;
@@ -160,6 +161,7 @@ impl Upsampler {
     }
     /// Zero insertion and reconstruction filtering; fixed gain prevents the
     /// amplitude loss from zero stuffing. Output at 48kHz, no slot conversion.
+    #[inline(never)]
     pub fn push(&mut self, sample: i16) -> [i16; 2] {
         // Polyphase form of the same zero-stuffed FIR: skip multiplications
         // by inserted zeros and compute both output phases from input history.
@@ -178,93 +180,40 @@ impl Upsampler {
     }
 }
 
-const WAKE_TAPS: [f32; 63] = [
-    -1.34932394668e-19f32,
-    3.76687698322e-06f32,
-    -1.82125347508e-05f32,
-    -9.43391178056e-05f32,
-    -0.0001532907693f32,
-    -4.01786368581e-05f32,
-    0.000313990088076f32,
-    0.000699405071441f32,
-    0.000652102959603f32,
-    -0.00017731941968f32,
-    -0.00151594548681f32,
-    -0.00231875069753f32,
-    -0.00137555913794f32,
-    0.00152075842012f32,
-    0.00475084187141f32,
-    0.00542849347449f32,
-    0.00151408682135f32,
-    -0.00580456123642f32,
-    -0.0116146227003f32,
-    -0.00999612267201f32,
-    0.00111892510647f32,
-    0.0163952737749f32,
-    0.0244892993464f32,
-    0.0151279428329f32,
-    -0.0118611235687f32,
-    -0.0420605758813f32,
-    -0.0513567001235f32,
-    -0.0192486387286f32,
-    0.0567495314559f32,
-    0.155151587874f32,
-    0.23830650571f32,
-    0.270826858055f32,
-    0.23830650571f32,
-    0.155151587874f32,
-    0.0567495314559f32,
-    -0.0192486387286f32,
-    -0.0513567001235f32,
-    -0.0420605758813f32,
-    -0.0118611235687f32,
-    0.0151279428329f32,
-    0.0244892993464f32,
-    0.0163952737749f32,
-    0.00111892510647f32,
-    -0.00999612267201f32,
-    -0.0116146227003f32,
-    -0.00580456123642f32,
-    0.00151408682135f32,
-    0.00542849347449f32,
-    0.00475084187141f32,
-    0.00152075842012f32,
-    -0.00137555913794f32,
-    -0.00231875069753f32,
-    -0.00151594548681f32,
-    -0.00017731941968f32,
-    0.000652102959603f32,
-    0.000699405071441f32,
-    0.000313990088076f32,
-    -4.01786368581e-05f32,
-    -0.0001532907693f32,
-    -9.43391178056e-05f32,
-    -1.82125347508e-05f32,
-    3.76687698322e-06f32,
-    -1.34932394668e-19f32,
+// Short local wake/AEC filter; cloud input retains the 63-tap converter.
+const WAKE_TAPS_Q15: [i32; 31] = [
+    0, -2, -13, -25, 5, 108, 228, 189, -189, -818, -1178, -503, 1640, 4809, 7699, 8868, 7699, 4809, 1640, -503, -1178, -818, -189, 189, 228, 108, 5, -25, -13, -2, 0
 ];
 
 /// 48kHz microphone words to band-limited 16kHz wake-model input.
 pub struct WakeDownsampler {
-    fir: Fir,
+    history: [i32; 31],
+    cursor: usize,
     phase: u8,
 }
 impl Default for WakeDownsampler {
     fn default() -> Self {
-        Self {
-            fir: Fir::new(),
-            phase: 0,
-        }
+        Self { history: [0; 31], cursor: 0, phase: 0 }
     }
 }
 impl WakeDownsampler {
+    #[inline(never)]
     pub fn push_word(&mut self, word: i32) -> Option<i16> {
-        self.fir.store((word >> 8) as f32 / 256.0);
-        self.phase = (self.phase + 1) % 3;
-        if self.phase != 0 {
-            return None;
+        self.history[self.cursor] = word >> 16;
+        self.cursor += 1;
+        if self.cursor == self.history.len() { self.cursor = 0; }
+        self.phase += 1;
+        if self.phase < 3 { return None; }
+        self.phase = 0;
+        let mut index = if self.cursor == 0 { 30 } else { self.cursor - 1 };
+        let mut sum = 0i64;
+        for tap in WAKE_TAPS_Q15 {
+            // Each Q15 coefficient/sample product fits i32; accumulation uses
+            // i64 so full-scale signals cannot overflow the filter.
+            sum += i64::from(tap * self.history[index]);
+            index = if index == 0 { 30 } else { index - 1 };
         }
-        Some(pcm16(self.fir.output_with(&WAKE_TAPS)))
+        Some((sum >> 15).clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16)
     }
 }
 

@@ -69,6 +69,10 @@ cargo build --locked
 ```
 
 The first build downloads ESP-IDF and its managed tools into `.embuild/`.
+Realtime I2S, wake detection and echo cancellation live in `crates/espal-audio`,
+compiled for speed independently of the session/upload firmware. Keep these
+profile settings: whole-firmware speed optimization caused a reproducible
+microphone-upload crash on the current Xtensa toolchain.
 Run `. ./export-esp.sh` in every new terminal before building.
 
 ## USB bring-up
@@ -154,6 +158,12 @@ assistant's conversation item to the portion played. Wait for the ready beep,
 then say your next request. General speech does not trigger interruption yet.
 `aec-check` checks synthetic echo suppression; `interrupt-check` runs twelve
 seconds of quiet local playback with AEC/WakeNet and checks detector reuse.
+`interrupt-network-check` repeats that test with Wi-Fi/TLS connected, then plays
+an OpenAI reply to a fixed text prompt. It does not upload microphone audio.
+Audio blocks larger than 1KiB and TLS allocations prefer PSRAM, with 64KiB
+reserved for internal-only allocations. The echo task checks remaining internal
+memory before playback starts. Network receive and speaker tasks run at audio
+priority so echo processing cannot starve them.
 Real speech and speaker echo rejection still require physical acceptance tests.
 
 WebSocket callbacks only copy bounded fragments into a queue. JSON assembly

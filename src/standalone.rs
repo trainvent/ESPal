@@ -1,4 +1,5 @@
-use crate::{audio::Diagnostics, config::Config, conversation, network::Network, wake::Detector};
+use espal_audio::wake::Detector;
+use crate::{audio::Diagnostics, config::Config, conversation, network::Network};
 use std::time::{Duration, Instant};
 
 pub fn run(
