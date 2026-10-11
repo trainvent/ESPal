@@ -19,8 +19,8 @@ const RATE: u32 = 48_000;
 const FRAMES: usize = 240;
 // 80ms of hardware buffering covers the measured Wi-Fi scheduling stalls.
 const DMA_BUFFERS: usize = 16;
-// Conservative bench speaker level: -24dB relative to received PCM.
-const SPEAKER_DIVISOR: i32 = 16;
+// Conservative bench speaker level: -18dB relative to received PCM.
+const SPEAKER_DIVISOR: i32 = 8;
 
 pub struct Diagnostics {
     driver: crate::duplex::Duplex,

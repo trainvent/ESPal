@@ -99,8 +99,8 @@ Live Wi-Fi/DHCP/SNTP, TLS certificate validation, OpenAI authentication and
 24kHz session configuration passed on 2026-10-09 using locally provisioned
 credentials. The `check` command performs this verification without microphone
 capture/upload. Spoken requests produce complete responses after queue fixes,
-and the exported received-response WAV sounds clear in VLC. Physical speaker
-playback remains distorted and is not accepted.
+and the exported received-response WAV sounds clear in VLC. Clean physical speaker
+playback is now confirmed by the user after TX-master duplex initialization.
 The current bench turn captures before uploading 100ms chunks; continuous input
 queues, multi-turn VAD sessions, capped reconnect backoff, DMA overrun/underrun
 telemetry and TLS-load memory/stack measurements remain outstanding.
@@ -220,3 +220,9 @@ loopback passes with 20,160 matched frames, zero invalid frames and zero gaps.
 This tests the clock-ownership difference from the clean standalone tone; it
 does not yet prove clean speech. Microphone RX remains enabled for capture and
 serviced during playback; no wiring change is requested for this test.
+
+The user confirmed clean, understandable speaker speech after the TX-master
+change. The level was somewhat quiet, so output attenuation is reduced from
+16× to 8× (-24→-18dB, a 6dB increase). This confirms the initial manual API
+turn works end to end; current capture/preparation latency, finite multi-turn
+conversation/VAD, fault testing and runtime resource telemetry remain open.

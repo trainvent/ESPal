@@ -81,7 +81,7 @@ espflash board-info --port /dev/ttyACM0 --before no-reset --after no-reset --ski
 The integration is implemented, host-tested and flashed. The offline filtered
 playback pipeline passes on the Nano. Live Wi-Fi, DHCP, synchronized time,
 TLS certificate validation, OpenAI authentication and session configuration
-were verified on 2026-10-09. Received reply PCM is clear in a VLC-tested WAV; physical speaker output remains distorted.
+were verified on 2026-10-09. Received reply PCM is clear in a VLC-tested WAV; the user confirmed clean physical speaker speech after initializing TX as duplex clock master.
 
 ```sh
 python3 tools/provision.py
@@ -112,7 +112,7 @@ The current speaker diagnostic collects the complete response, limited to twenty
 seconds of PCM, and performs filtered 24→48kHz conversion before starting I2S.
 During playback only sample packing and DMA service run. This increases startup
 latency while isolating processing stalls; continuous streaming is still planned.
-Speaker output is attenuated 16× (-24dB), with 80ms of I2S DMA buffering.
+Speaker output is attenuated 8× (-18dB), with 80ms of I2S DMA buffering.
 Microphone uploads stay gated during playback and a 500ms acoustic tail. The
 120-second diagnostic turn deadline and bounded packet queues remain enforced. Errors stop
 audio and close the socket; automatic reconnect is disabled for bench testing.
