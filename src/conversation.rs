@@ -78,32 +78,182 @@ pub fn check(config: &Config) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Keep capture, filtering and upload independent. Both queues hold at most
+/// two seconds; overflow cancels the input instead of dropping speech.
+fn stream_input(
+    audio: &mut Diagnostics,
+    gain: u8,
+    deadline: Instant,
+    mut upload: impl FnMut(&[u8]) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    // app_main runs at priority 1, whereas Rust worker threads default to 5.
+    // Give the uploader equal scheduling priority while this pipeline runs;
+    // restore its original priority on every exit path.
+    struct UploadPriority(esp_idf_svc::sys::UBaseType_t);
+    impl Drop for UploadPriority {
+        fn drop(&mut self) {
+            unsafe { esp_idf_svc::sys::vTaskPrioritySet(std::ptr::null_mut(), self.0) };
+        }
+    }
+    let original_priority = unsafe { esp_idf_svc::sys::uxTaskPriorityGet(std::ptr::null_mut()) };
+    let _priority = UploadPriority(original_priority);
+    unsafe { esp_idf_svc::sys::vTaskPrioritySet(std::ptr::null_mut(), original_priority.max(5)) };
+    let (raw_sender, raw_receiver) = mpsc::sync_channel::<Vec<i32>>(40);
+    let (pcm_sender, pcm_receiver) = mpsc::sync_channel::<Vec<u8>>(20);
+    let raw_queued = AtomicUsize::new(0);
+    let pcm_queued = AtomicUsize::new(0);
+    let cancel = AtomicBool::new(false);
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        let raw_ref = &raw_queued;
+        let pcm_ref = &pcm_queued;
+        let cancel_ref = &cancel;
+        let capture = std::thread::Builder::new()
+            .name("microphone".into())
+            .stack_size(8192)
+            .spawn_scoped(scope, move || {
+                let result = audio.stream_capture(raw_sender, raw_ref, cancel_ref, deadline);
+                if result.is_err() {
+                    cancel_ref.store(true, Ordering::Release);
+                }
+                result
+            })
+            .map_err(|_| "Microphone task failed")?;
+        let filter = std::thread::Builder::new()
+            .name("input-filter".into()).stack_size(8192)
+            .spawn_scoped(scope, move || {
+                let result = (|| {
+                    let mut down = Downsampler::new(gain);
+                    let mut chunk = Vec::with_capacity(4800);
+                    let mut samples = 0usize;
+                    let mut max_queued = 0usize;
+                    loop {
+                        if cancel_ref.load(Ordering::Acquire) || Instant::now() >= deadline {
+                            return Err("Input filter cancelled");
+                        }
+                        let block = match raw_receiver.recv_timeout(Duration::from_millis(50)) {
+                            Ok(block) => block,
+                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        };
+                        let len = block.len();
+                        for word in block {
+                            samples += 1;
+                            if let Some(sample) = down.push_word(word) {
+                                chunk.extend_from_slice(&sample.to_le_bytes());
+                            }
+                            if chunk.len() == 4800 {
+                                let pending = pcm_ref.fetch_add(chunk.len(), Ordering::AcqRel) + chunk.len();
+                                max_queued = max_queued.max(pending);
+                                if pcm_sender.try_send(std::mem::replace(&mut chunk, Vec::with_capacity(4800))).is_err() {
+                                    pcm_ref.fetch_sub(4800, Ordering::AcqRel);
+                                    return Err("Input upload buffer overflow or uploader stopped; input cancelled");
+                                }
+                                // A full RTOS tick lets Wi-Fi and idle tasks run.
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                        }
+                        raw_ref.fetch_sub(len, Ordering::AcqRel);
+                    }
+                    if samples != 240_000 || !chunk.is_empty() {
+                        return Err("Input stream incomplete; turn not committed");
+                    }
+                    Ok((down.clipped, max_queued))
+                })();
+                if result.is_err() { cancel_ref.store(true, Ordering::Release); }
+                result
+            });
+        let filter = match filter {
+            Ok(filter) => filter,
+            Err(_) => {
+                cancel.store(true, Ordering::Release);
+                let _ = capture.join();
+                return Err("Input filter task failed");
+            }
+        };
+        let mut uploaded = 0usize;
+        let sent = (|| {
+            loop {
+                if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    return Err("Input upload cancelled");
+                }
+                match pcm_receiver.recv_timeout(Duration::from_millis(50)) {
+                    Ok(chunk) => {
+                        upload(&chunk)?;
+                        uploaded += chunk.len();
+                        pcm_queued.fetch_sub(chunk.len(), Ordering::AcqRel);
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            Ok(())
+        })();
+        if sent.is_err() {
+            cancel.store(true, Ordering::Release);
+        }
+        log::info!("Input upload: uploaded_bytes={uploaded} elapsed_ms={} raw_pending_samples={} pcm_pending_bytes={}", started.elapsed().as_millis(), raw_queued.load(Ordering::Acquire), pcm_queued.load(Ordering::Acquire));
+        drop(pcm_receiver);
+        let captured = capture.join().map_err(|_| "Microphone task panicked")?;
+        let converted = filter.join().map_err(|_| "Input filter task panicked")?;
+        if let Err(e) = sent {
+            if e != "Input upload cancelled" {
+                return Err(e);
+            }
+        }
+        // Preserve a concrete worker error rather than its cancellation fallout.
+        if let Err(e) = captured {
+            if e != "Microphone streaming cancelled" {
+                return Err(e);
+            }
+        }
+        if let Err(e) = converted {
+            if e != "Input filter cancelled" {
+                return Err(e);
+            }
+        }
+        sent?;
+        let (samples, capture_ms, raw_max) = captured?;
+        let (clipped, pcm_max) = converted?;
+        if uploaded != 240_000
+            || raw_queued.load(Ordering::Acquire) != 0
+            || pcm_queued.load(Ordering::Acquire) != 0
+        {
+            return Err("Input upload incomplete; turn not committed");
+        }
+        let elapsed = started.elapsed().as_millis();
+        log::info!("Input streaming: capture_samples={samples} capture_ms={capture_ms} uploaded_bytes={uploaded} total_ms={elapsed} drain_ms={} max_raw_buffer_ms={} max_pcm_buffer_ms={} clipped_samples={clipped}", elapsed.saturating_sub(capture_ms), raw_max / 48, pcm_max / 48);
+        Ok(())
+    })
+}
+
+/// Exercise the real capture/filter queues with a deliberately slower consumer,
+/// without sending audio over the network or playing it through the speaker.
+pub fn input_test(audio: &mut Diagnostics) -> Result<(), &'static str> {
+    stream_input(audio, 1, Instant::now() + Duration::from_secs(20), |_| {
+        std::thread::sleep(Duration::from_millis(120));
+        Ok(())
+    })?;
+    let failure = stream_input(audio, 1, Instant::now() + Duration::from_secs(5), |_| {
+        Err("Injected upload failure")
+    });
+    if failure != Err("Injected upload failure") {
+        return Err("Input cancellation test failed");
+    }
+    audio
+        .run(false)
+        .map_err(|_| "Capture driver unavailable after cancellation")?;
+    log::info!("Input streaming test complete; five seconds captured and queues drained, no network upload");
+    Ok(())
+}
+
 fn request(audio: &mut Diagnostics, config: &Config) -> Result<(Socket, Instant), &'static str> {
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut socket = open_session(config, deadline)?;
-    log::info!("LISTENING: speak now for five seconds");
-    let raw = audio.record().map_err(|_| "Microphone capture failed")?;
-    let mut down = Downsampler::new(config.mic_gain);
-    let mut chunk = Vec::with_capacity(4800);
-    log::info!("Uploading filtered 24kHz PCM16");
-    for frame in raw.chunks_exact(3) {
-        let word = i32::from_le_bytes([0, frame[0], frame[1], frame[2]]);
-        if let Some(sample) = down.push_word(word) {
-            chunk.extend_from_slice(&sample.to_le_bytes());
-        }
-        if chunk.len() == 4800 {
-            if Instant::now() >= deadline {
-                return Err("Turn deadline exceeded while uploading");
-            }
-            socket.send(&realtime::append(&chunk))?;
-            chunk.clear();
-            // At 100Hz a 1ms sleep can round to zero RTOS ticks.
-            // Block for a full tick so Wi-Fi/idle tasks can run during upload.
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-    log::info!("Input conversion clipped samples={}", down.clipped);
-    drop(raw);
+    stream_input(audio, config.mic_gain, deadline, |chunk| {
+        socket.send(&realtime::append(chunk))
+    })?;
     socket.send(&json!({"type":"input_audio_buffer.commit"}))?;
     socket.send(&json!({"type":"response.create"}))?;
     Ok((socket, deadline))

@@ -108,9 +108,14 @@ recording played correctly in VLC. Keep credentials out of chat and source.
 synchronization. `check` verifies OpenAI authentication and audio session configuration
 without capturing or uploading microphone audio. `turn` opens a certificate/hostname-validated WebSocket to
 OpenAI, configures mono 24kHz PCM16 with turn detection disabled, then prints
-`LISTENING`. Speak for five seconds at that point. The Nano captures locally,
-filters 48→24kHz with a 63-tap low-pass FIR, sends 100ms base64 PCM chunks,
-commits the turn, and requests a spoken response.
+`LISTENING`. Speak for five seconds at that point. Separate tasks capture the
+microphone, filter 48→24kHz with a 63-tap low-pass FIR, and upload 100ms base64
+PCM chunks while you speak. Two bounded queues each hold up to two seconds
+between stages. Upload temporarily uses the same priority as the audio workers;
+its original priority is restored afterward. The turn is committed only after
+all 240,000 native samples become 240,000 uploaded PCM bytes and both queues
+drain. An overflow or upload failure cancels input and closes the session.
+`Input streaming:` logs capture time, total time, buffer peaks and clipping.
 
 Reply audio is filtered and packed on a separate task while the speaker task
 services DMA. Playback starts after 400ms is prepared (or a shorter reply ends),
@@ -129,6 +134,9 @@ not logged; HTTP authentication/access/quota errors are redacted descriptions.
 
 An optional `pipeline` command plays a brief quiet tone through the same
 48→24→48kHz filters and bounded playback path without any network request.
+`input-test` captures locally with a deliberately slow consumer, then injects
+an upload failure and verifies the capture driver remains usable. It neither
+uploads microphone audio nor plays it through the speaker.
 
 ## Build, flash and test
 

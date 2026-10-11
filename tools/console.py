@@ -7,7 +7,7 @@ import serial
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["help", "stats", "tone", "tone16", "tone-pico", "pipeline", "loopback", "connect", "check", "turn", "forget", "voice"])
+    parser.add_argument("command", choices=["help", "stats", "tone", "tone16", "tone-pico", "pipeline", "loopback", "input-test", "connect", "check", "turn", "forget", "voice"])
     parser.add_argument("voice", nargs="?", choices=["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar"])
     parser.add_argument("--port", default="/dev/ttyACM0")
     args = parser.parse_args()
@@ -46,6 +46,8 @@ def main():
                 if args.command == "loopback" and b"I2S loopback complete;" in line:
                     return
                 if args.command == "pipeline" and b"Filtered pipeline test complete:" in line:
+                    return
+                if args.command == "input-test" and b"Input streaming test complete;" in line:
                     return
                 if args.command in ("help", "stats", "tone", "tone16", "forget") and b"espal" in line:
                     return

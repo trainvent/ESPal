@@ -445,6 +445,86 @@ impl Diagnostics {
         Ok(pcm)
     }
 
+    pub fn stream_capture(
+        &mut self,
+        sender: std::sync::mpsc::SyncSender<Vec<i32>>,
+        queued: &AtomicUsize,
+        cancel: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<(usize, u128, usize), &'static str> {
+        self.preload_silence()
+            .map_err(|_| "Capture preload failed")?;
+        self.driver
+            .rx_enable()
+            .map_err(|_| "Capture RX enable failed")?;
+        if self.driver.tx_enable().is_err() {
+            let _ = self.driver.rx_disable();
+            return Err("Capture TX enable failed");
+        }
+        log::info!("LISTENING: speak now for five seconds; upload streams during capture");
+        let started = Instant::now();
+        let mut samples = 0usize;
+        let mut max_queued = 0usize;
+        let result = (|| {
+            let mut input = [0u8; FRAMES * 8];
+            let mut block = Vec::with_capacity(2400);
+            let timeout = TickType::new_millis(100).ticks();
+            while samples < 240_000 {
+                if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    return Err("Microphone streaming cancelled");
+                }
+                // TX generates shared clocks; its preloaded silence is cleared
+                // automatically by DMA. No microphone audio is sent to TX.
+                let n = self
+                    .driver
+                    .read(&mut input, timeout)
+                    .map_err(|_| "Microphone read failed")?;
+                if n == 0 || n % 8 != 0 {
+                    return Err("Invalid microphone DMA read");
+                }
+                for frame in input[..n].chunks_exact(8) {
+                    block.push(i32::from_le_bytes(frame[..4].try_into().unwrap()));
+                    samples += 1;
+                    if block.len() == 2400 {
+                        let pending = queued.fetch_add(block.len(), Ordering::AcqRel) + block.len();
+                        max_queued = max_queued.max(pending);
+                        let len = block.len();
+                        if sender
+                            .try_send(std::mem::replace(&mut block, Vec::with_capacity(2400)))
+                            .is_err()
+                        {
+                            queued.fetch_sub(len, Ordering::AcqRel);
+                            return Err(
+                                "Microphone buffer overflow or filter stopped; input cancelled",
+                            );
+                        }
+                    }
+                    if samples == 240_000 {
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        let elapsed = started.elapsed().as_millis();
+        let tx = self.driver.tx_disable();
+        let rx = self.driver.rx_disable();
+        log::info!(
+            "Input capture: samples={samples} elapsed_ms={elapsed} max_raw_buffer_ms={}",
+            max_queued / 48
+        );
+        if result.is_err() {
+            cancel.store(true, Ordering::Release);
+        }
+        result?;
+        if tx.is_err() || rx.is_err() {
+            cancel.store(true, Ordering::Release);
+            return Err("Microphone capture shutdown failed");
+        }
+        log::info!("Capture finished; remaining microphone upload is draining");
+        Ok((samples, elapsed, max_queued))
+    }
+
     pub fn new(
         i2s: esp_idf_svc::hal::i2s::I2S0<'static>,
         pins: esp_idf_svc::hal::gpio::Pins,

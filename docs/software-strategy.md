@@ -253,3 +253,29 @@ filter-tail padding in 1.720 seconds including acoustic tail, reported zero
 preparation gaps, and drained the raw queue. Maximum measured conversion batch
 was 9,831 microseconds. Live Wi-Fi/OpenAI speech quality and gap counts still
 require a user listening test; local timing is not a network-load guarantee.
+
+The user's live streaming playback test completed 12.4 seconds of speech with
+zero preparation gaps; playback began 1.51 seconds after input upload finished.
+Input still spent 7.16 seconds processing/uploading after five seconds of capture.
+
+Microphone capture now runs independently of FIR conversion and upload.
+Capture emits 50ms signed 32-bit native blocks to a 40-block queue; conversion
+maintains decimator state and emits 100ms PCM16 blocks to a 20-block queue.
+Both queues are bounded at two seconds excluding active blocks. Input is
+committed only after exactly 240,000 captured samples and 240,000 uploaded
+bytes, successful task joins, and drained counters. Overflow/deadline/upload
+failure cancels capture and prevents a partial commit. Recording export keeps
+its existing diagnostic implementation. Playback still gates microphone upload.
+
+A slow-consumer test first exposed priority starvation: app_main's uploader
+priority 1 was lower than the capture/filter workers' priority 5. During input
+streaming the uploader now temporarily uses at least priority 5 and restores its
+original priority through a drop guard on every return path. The final flashed
+test captured 240,000 samples in 4,998ms while the consumer intentionally slept
+120ms per 100ms audio block. All 240,000 PCM bytes drained in 7,646ms total,
+with raw buffering peaking at 100ms, PCM buffering at 1,800ms, and zero clipping.
+This artificial slowdown is a buffer stress check, not an OpenAI latency result.
+An injected upload error stopped capture after 141ms; a subsequent one-second
+silence/capture diagnostic returned 48,000 samples with no read timeouts,
+confirming channel reuse. Firmware builds and ten core tests pass. Live network
+input latency and speech recognition remain to be verified by the user.
