@@ -90,6 +90,10 @@ python3 tools/console.py check
 python3 tools/console.py turn
 ```
 
+Change the saved voice without re-entering credentials using
+`python3 tools/console.py voice cedar` (or another supported Realtime voice).
+The voice applies to subsequent turns and persists across restarts.
+
 The setup tool prompts locally for a 2.4GHz Wi-Fi SSID/password and a dedicated
 OpenAI project key. Password/key entry is hidden. A validated config is saved
 atomically as one NVS blob; no secret file is created. Ordinary NVS does not
@@ -112,7 +116,7 @@ The current speaker diagnostic collects the complete response, limited to twenty
 seconds of PCM, and performs filtered 24→48kHz conversion before starting I2S.
 During playback only sample packing and DMA service run. This increases startup
 latency while isolating processing stalls; continuous streaming is still planned.
-Speaker output is attenuated 8× (-18dB), with 80ms of I2S DMA buffering.
+Speaker output is attenuated 4× (-12dB), with 80ms of I2S DMA buffering.
 Microphone uploads stay gated during playback and a 500ms acoustic tail. The
 120-second diagnostic turn deadline and bounded packet queues remain enforced. Errors stop
 audio and close the socket; automatic reconnect is disabled for bench testing.

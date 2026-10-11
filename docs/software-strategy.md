@@ -226,3 +226,13 @@ change. The level was somewhat quiet, so output attenuation is reduced from
 16× to 8× (-24→-18dB, a 6dB increase). This confirms the initial manual API
 turn works end to end; current capture/preparation latency, finite multi-turn
 conversation/VAD, fault testing and runtime resource telemetry remain open.
+
+Microphone decimation now stores all 48kHz input samples but computes the
+63-tap convolution only for emitted 24kHz samples, halving convolution work.
+An exact comparison against the full-rate reference covers three gains,
+signed inputs and clipping counts; all ten core tests and the firmware build
+pass. The firmware is flashed; on-device turn latency remains to be measured.
+
+The user confirmed clean speech at 8× attenuation and requested another
+doubling of speaker amplitude. Output attenuation is now 4× (-12dB),
+another 6dB increase; the shared-clock and conversion configuration is unchanged.

@@ -42,4 +42,17 @@ impl Store {
         self.nvs.remove("config").map_err(|_| "NVS erase failed")?;
         Ok(())
     }
+    pub fn set_voice(&self, voice: &str) -> Result<Config, &'static str> {
+        let mut config = self.load()?.ok_or("Provision credentials first")?;
+        config.voice = voice.into();
+        config.validate()?;
+        let mut bytes = serde_json::to_vec(&config).map_err(|_| "Config encoding failed")?;
+        let result = self
+            .nvs
+            .set_blob("config", &bytes)
+            .map_err(|_| "NVS write failed");
+        bytes.fill(0);
+        result?;
+        Ok(config)
+    }
 }

@@ -7,9 +7,12 @@ import serial
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["help", "stats", "tone", "tone16", "tone-pico", "pipeline", "loopback", "connect", "check", "turn", "forget"])
+    parser.add_argument("command", choices=["help", "stats", "tone", "tone16", "tone-pico", "pipeline", "loopback", "connect", "check", "turn", "forget", "voice"])
+    parser.add_argument("voice", nargs="?", choices=["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar"])
     parser.add_argument("--port", default="/dev/ttyACM0")
     args = parser.parse_args()
+    if (args.command == "voice") != (args.voice is not None):
+        parser.error("Use voice NAME to change the saved voice")
     port = serial.Serial()
     port.port = args.port
     port.baudrate = 115200
@@ -22,13 +25,16 @@ def main():
         port.reset_input_buffer()
         if args.command == "turn":
             input("Press Enter when ready. Speak when LISTENING appears: ")
-        port.write((args.command + "\n").encode())
+        command = f"voice {args.voice}" if args.command == "voice" else args.command
+        port.write((command + "\n").encode())
         port.flush()
         deadline = time.monotonic() + (180 if args.command == "turn" else 40)
         while time.monotonic() < deadline:
             line = port.readline(4096)
             if line:
                 print(line.decode("utf-8", "replace").strip(), flush=True)
+                if args.command == "voice" and line.strip() == f"ESPAL_VOICE {args.voice}".encode():
+                    return
                 if b"OpenAI session ready;" in line or b"Turn finished;" in line or b"synchronized time ready" in line and args.command == "connect":
                     return
                 if b"espal:" in line and b"E (" in line:

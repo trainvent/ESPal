@@ -78,16 +78,27 @@ impl Fir {
             cursor: 0,
         }
     }
-    fn push(&mut self, sample: f32) -> f32 {
+    fn store(&mut self, sample: f32) {
         self.history[self.cursor] = sample;
+        self.cursor = (self.cursor + 1) % 63;
+    }
+    fn output(&self) -> f32 {
         let mut result = 0.0;
-        let mut index = self.cursor;
+        let mut index = if self.cursor == 0 {
+            62
+        } else {
+            self.cursor - 1
+        };
         for tap in TAPS {
             result += tap * self.history[index];
             index = if index == 0 { 62 } else { index - 1 };
         }
-        self.cursor = (self.cursor + 1) % 63;
         result
+    }
+    #[cfg(test)]
+    fn push(&mut self, sample: f32) -> f32 {
+        self.store(sample);
+        self.output()
     }
 }
 
@@ -113,11 +124,14 @@ impl Downsampler {
     /// Left-aligned signed PCM24 from the mic -> filtered 24kHz PCM16.
     /// Maintain this object across DMA/chunk boundaries; reset between turns.
     pub fn push_word(&mut self, word: i32) -> Option<i16> {
-        let filtered = self.fir.push((word >> 8) as f32 * self.gain / 256.0);
+        self.fir.store((word >> 8) as f32 * self.gain / 256.0);
         self.phase = !self.phase;
         if self.phase {
             return None;
         }
+        // Decimation discards alternate outputs. Retain every input sample,
+        // but only run the convolution for the outputs we actually emit.
+        let filtered = self.fir.output();
         if !(-32768.0..=32767.0).contains(&filtered) {
             self.clipped += 1;
         }
@@ -164,6 +178,28 @@ impl Upsampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn decimation_matches_full_rate_reference() {
+        for gain in [1, 8, 32] {
+            let mut reference = Fir::new();
+            let mut optimized = Downsampler::new(gain);
+            let mut clipped = 0;
+            for index in 0..8192 {
+                let word = (index as i32).wrapping_mul(7919 * 65536);
+                let filtered = reference.push((word >> 8) as f32 * gain as f32 / 256.0);
+                let expected = if index % 2 == 1 {
+                    if !(-32768.0..=32767.0).contains(&filtered) {
+                        clipped += 1;
+                    }
+                    Some(pcm16(filtered))
+                } else {
+                    None
+                };
+                assert_eq!(optimized.push_word(word), expected);
+            }
+            assert_eq!(optimized.clipped, clipped);
+        }
+    }
     fn response(hz: f32) -> f32 {
         let mut filter = Downsampler::new(1);
         let mut energy = 0.0;

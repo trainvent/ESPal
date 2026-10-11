@@ -74,6 +74,14 @@ fn main() {
                             }
                             Err(e) => log::error!("Provisioning failed: {e}"),
                         }
+                    } else if let Some(voice) = command.strip_prefix("voice ") {
+                        match store.set_voice(voice) {
+                            Ok(c) => {
+                                println!("ESPAL_VOICE {}", c.voice);
+                                config = Some(c);
+                            }
+                            Err(e) => log::error!("Voice change failed: {e}"),
+                        }
                     } else {
                         let result = (|| -> Result<(), &'static str> {
                             match command {
