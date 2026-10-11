@@ -375,7 +375,22 @@ fn play_response(
     deadline: Instant,
 ) -> Result<(), &'static str> {
     log::info!("Waiting for spoken response; microphone upload gated");
-    let (sender, receiver) = mpsc::sync_channel(512);
+    // Generation can outrun the speaker for an entire long answer. Budget the
+    // pending PCM against currently available PSRAM, after the wake model and
+    // TLS session have been allocated. Keep 2MiB for prepared audio, WebSocket
+    // messages and other allocations; never consume the whole heap.
+    let free_psram =
+        unsafe { esp_idf_svc::sys::heap_caps_get_free_size(esp_idf_svc::sys::MALLOC_CAP_SPIRAM) };
+    let queue_limit = (48_000 * 60).min(free_psram.saturating_sub(2 * 1024 * 1024));
+    if queue_limit < 48_000 {
+        return Err("Insufficient memory for response buffering");
+    }
+    log::info!(
+        "Reply buffer: capacity_ms={} free_psram_bytes={free_psram}",
+        queue_limit / 48
+    );
+    // Leave enough message slots for small deltas within the larger byte budget.
+    let (sender, receiver) = mpsc::sync_channel(2048);
     let queued = AtomicUsize::new(0);
     let cancel = AtomicBool::new(false);
     let mut received_bytes = 0usize;
@@ -390,35 +405,35 @@ fn play_response(
                 audio.playback(receiver, queued_ref, cancel_ref, deadline)
             })
             .map_err(|_| "Speaker task failed")?;
-        let stream = (|| {
-            loop {
-                let event = socket.receive(deadline)?;
-                check_error(&event)?;
-                if let Some(bytes) = realtime::audio_delta(&event)? {
-                    if worker.is_finished() {
-                        return Err("Speaker stopped before response completion");
-                    }
-                    // Allow response-generation bursts ahead of real-time playback.
-                    // Twenty seconds of PCM (960KB) remains bounded and fits PSRAM.
-                    received_bytes += bytes.len();
-                    let previous = queued.fetch_add(bytes.len(), Ordering::AcqRel);
-                    max_queued = max_queued.max(previous + bytes.len());
-                    if previous + bytes.len() > 960000 {
-                        return Err("Playback overflow; response cancelled");
-                    }
-                    sender
-                        .try_send(Playback::Audio(bytes))
-                        .map_err(|_| "Playback queue overflow; response cancelled")?;
+        let stream = (|| loop {
+            let event = socket.receive(deadline)?;
+            check_error(&event)?;
+            if let Some(bytes) = realtime::audio_delta(&event)? {
+                if worker.is_finished() {
+                    return Err("Speaker stopped before response completion");
                 }
-                if event["type"] == "response.done" {
-                    if event["response"]["status"] != "completed" {
-                        return Err("OpenAI response did not complete");
-                    }
-                    sender
-                        .try_send(Playback::End)
-                        .map_err(|_| "Playback completion queue overflow")?;
-                    return Ok(());
+                received_bytes += bytes.len();
+                let previous = queued.fetch_add(bytes.len(), Ordering::AcqRel);
+                max_queued = max_queued.max(previous + bytes.len());
+                if previous + bytes.len() > queue_limit {
+                    queued.fetch_sub(bytes.len(), Ordering::AcqRel);
+                    log::warn!("Reply buffer full: pending_bytes={previous} delta_bytes={} capacity_bytes={queue_limit}", bytes.len());
+                    return Err("Playback overflow; response cancelled");
                 }
+                let len = bytes.len();
+                if sender.try_send(Playback::Audio(bytes)).is_err() {
+                    queued.fetch_sub(len, Ordering::AcqRel);
+                    return Err("Playback queue overflow; response cancelled");
+                }
+            }
+            if event["type"] == "response.done" {
+                if event["response"]["status"] != "completed" {
+                    return Err("OpenAI response did not complete");
+                }
+                sender
+                    .try_send(Playback::End)
+                    .map_err(|_| "Playback completion queue overflow")?;
+                return Ok(());
             }
         })();
         if stream.is_err() {
