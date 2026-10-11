@@ -24,10 +24,10 @@ fn check_error(event: &serde_json::Value) -> Result<(), &'static str> {
 /// Realtime, without networking or microphone upload.
 pub fn pipeline_test(audio: &mut Diagnostics) -> Result<(), &'static str> {
     let mut down = Downsampler::new(1);
-    let mut pcm = Vec::with_capacity(9600);
-    for index in 0..9600 {
+    let mut pcm = Vec::with_capacity(57600);
+    for index in 0..57600 {
         let t = index as f32 / 48000.0;
-        let envelope = (t / 0.01).min((0.2 - t) / 0.01).clamp(0.0, 1.0);
+        let envelope = (t / 0.01).min((1.2 - t) / 0.01).clamp(0.0, 1.0);
         let sample = ((t * 440.0 * std::f32::consts::TAU).sin() * envelope * 327.0) as i32;
         if let Some(v) = down.push_word(sample << 16) {
             pcm.extend_from_slice(&v.to_le_bytes());
@@ -43,7 +43,7 @@ pub fn pipeline_test(audio: &mut Diagnostics) -> Result<(), &'static str> {
         .send(Playback::End)
         .map_err(|_| "Pipeline queue failed")?;
     audio.playback(
-        &receiver,
+        receiver,
         &queued,
         &cancel,
         Instant::now() + Duration::from_secs(5),
@@ -147,7 +147,7 @@ pub fn turn(audio: &mut Diagnostics, config: &Config) -> Result<(), &'static str
             .name("speaker".into())
             .stack_size(8192)
             .spawn_scoped(scope, move || {
-                audio.playback(&receiver, queued_ref, cancel_ref, deadline)
+                audio.playback(receiver, queued_ref, cancel_ref, deadline)
             })
             .map_err(|_| "Speaker task failed")?;
         let stream = (|| {

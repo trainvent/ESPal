@@ -236,3 +236,20 @@ pass. The firmware is flashed; on-device turn latency remains to be measured.
 The user confirmed clean speech at 8× attenuation and requested another
 doubling of speaker amplitude. Output attenuation is now 4× (-12dB),
 another 6dB increase; the shared-clock and conversion configuration is unchanged.
+
+The user confirmed a clean 18.6-second answer at divisor 4. Its diagnostic
+full-response preparation took 18.812 seconds, motivating streaming playback.
+Reply conversion/slot packing now runs on a separate task from DMA servicing:
+400ms initial priming, a bounded two-second prepared queue, and the existing
+twenty-second raw PCM queue cap. Cancellation drops the prepared receiver to
+unblock the converter, and stops both I2S channels. Conversion retains FIR state
+across packets and flushes its tail; playback still services gated RX and sends
+500ms silence afterward. No full-response wait or ten-millisecond sleep per
+20ms converted block remains; conversion yields one RTOS tick per 100ms audio.
+
+All ten host tests and the firmware build pass. The flashed Nano's 1.2-second
+local pipeline test primed 400ms in 188ms, played 58,560 output frames including
+filter-tail padding in 1.720 seconds including acoustic tail, reported zero
+preparation gaps, and drained the raw queue. Maximum measured conversion batch
+was 9,831 microseconds. Live Wi-Fi/OpenAI speech quality and gap counts still
+require a user listening test; local timing is not a network-load guarantee.

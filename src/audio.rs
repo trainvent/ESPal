@@ -38,65 +38,150 @@ impl Diagnostics {
     }
     pub fn playback(
         &mut self,
-        receiver: &Receiver<Playback>,
+        receiver: Receiver<Playback>,
         queued: &AtomicUsize,
         cancel: &AtomicBool,
         deadline: Instant,
     ) -> Result<(), &'static str> {
-        // Bench isolation: complete response + FIR conversion before clocks
-        // start. During playback only copy precomputed samples and service DMA.
-        let mut pcm = Vec::new();
-        loop {
-            if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
-                return Err("Playback preparation cancelled");
-            }
-            match receiver.recv_timeout(Duration::from_millis(50)) {
-                Ok(Playback::Audio(bytes)) => {
-                    if pcm.len() + bytes.len() > 960000 {
-                        return Err("Prepared reply exceeds twenty seconds");
+        // Conversion runs independently of DMA servicing. Bound the prepared
+        // queue to two seconds, and prime 400ms before starting the clocks.
+        std::thread::scope(|scope| {
+            let (sender, prepared) = std::sync::mpsc::sync_channel(100);
+            let converter = std::thread::Builder::new()
+                .name("reply-filter".into())
+                .stack_size(8192)
+                .spawn_scoped(scope, move || {
+                    let mut filter = espal_core::dsp::Upsampler::new();
+                    let mut output = Vec::with_capacity(960 * 8);
+                    let mut samples = 0usize;
+                    let mut peak = 0i32;
+                    let mut max_conversion_us = 0u128;
+                    let mut ended = false;
+                    while !ended {
+                        if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
+                            return Err("Reply conversion cancelled");
+                        }
+                        match receiver.recv_timeout(Duration::from_millis(50)) {
+                            Ok(Playback::Audio(bytes)) => {
+                                let mut converting = Instant::now();
+                                for bytes in bytes.chunks_exact(2) {
+                                    let sample = i16::from_le_bytes([bytes[0], bytes[1]]);
+                                    samples += 1;
+                                    peak = peak.max(i32::from(sample).abs());
+                                    for value in filter.push(sample) {
+                                        let word = ((i32::from(value) / SPEAKER_DIVISOR) << 16)
+                                            .to_le_bytes();
+                                        output.extend_from_slice(&word);
+                                        output.extend_from_slice(&word);
+                                    }
+                                    if output.len() == 960 * 8 {
+                                        max_conversion_us =
+                                            max_conversion_us.max(converting.elapsed().as_micros());
+                                        sender
+                                            .send(Playback::Audio(std::mem::replace(
+                                                &mut output,
+                                                Vec::with_capacity(960 * 8),
+                                            )))
+                                            .map_err(|_| "Prepared audio queue disconnected")?;
+                                        // Once per 100ms of audio, yield a full RTOS tick.
+                                        if samples % 2400 == 0 {
+                                            std::thread::sleep(Duration::from_millis(10));
+                                        }
+                                        if cancel.load(Ordering::Acquire)
+                                            || Instant::now() >= deadline
+                                        {
+                                            return Err("Reply conversion cancelled");
+                                        }
+                                        converting = Instant::now();
+                                    }
+                                }
+                                queued.fetch_sub(bytes.len(), Ordering::AcqRel);
+                            }
+                            Ok(Playback::End) => ended = true,
+                            Err(RecvTimeoutError::Disconnected) => {
+                                return Err("Playback queue disconnected")
+                            }
+                            Err(RecvTimeoutError::Timeout) => {}
+                        }
                     }
-                    pcm.try_reserve(bytes.len())
-                        .map_err(|_| "Reply preparation allocation failed")?;
-                    pcm.extend(bytes);
+                    if samples == 0 {
+                        return Err("No response audio received");
+                    }
+                    // Flush the reconstruction filter before padding the last frame.
+                    for _ in 0..63 {
+                        for value in filter.push(0) {
+                            let word = ((i32::from(value) / SPEAKER_DIVISOR) << 16).to_le_bytes();
+                            output.extend_from_slice(&word);
+                            output.extend_from_slice(&word);
+                            if output.len() == 960 * 8 {
+                                sender
+                                    .send(Playback::Audio(std::mem::replace(
+                                        &mut output,
+                                        Vec::with_capacity(960 * 8),
+                                    )))
+                                    .map_err(|_| "Prepared audio queue disconnected")?;
+                            }
+                        }
+                    }
+                    if !output.is_empty() {
+                        output.resize(960 * 8, 0);
+                        sender
+                            .send(Playback::Audio(output))
+                            .map_err(|_| "Prepared audio queue disconnected")?;
+                    }
+                    sender
+                        .send(Playback::End)
+                        .map_err(|_| "Prepared audio queue disconnected")?;
+                    Ok((samples, peak, max_conversion_us))
+                })
+                .map_err(|_| "Reply filter task failed")?;
+            let played = self.play_prepared(&prepared, cancel, deadline);
+            if played.is_err() {
+                cancel.store(true, Ordering::Release);
+            }
+            // Unblock a converter waiting on a full queue after DMA failure.
+            drop(prepared);
+            let converted = converter.join().map_err(|_| "Reply filter task panicked")?;
+            match (played, converted) {
+                (Err(e), _) => Err(e),
+                (_, Err(e)) => Err(e),
+                (Ok(()), Ok((samples, peak, max_us))) => {
+                    log::info!("Response conversion: pcm24_samples={samples} peak16={peak} max_chunk_conversion_us={max_us}");
+                    Ok(())
                 }
-                Ok(Playback::End) => break,
-                Err(RecvTimeoutError::Disconnected) => return Err("Playback queue disconnected"),
+            }
+        })
+    }
+
+    fn play_prepared(
+        &mut self,
+        prepared: &Receiver<Playback>,
+        cancel: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<(), &'static str> {
+        let waiting = Instant::now();
+        let mut primed = std::collections::VecDeque::new();
+        let mut ended = false;
+        while primed.len() < 20 && !ended {
+            if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
+                return Err("Playback priming cancelled");
+            }
+            match prepared.recv_timeout(Duration::from_millis(50)) {
+                Ok(Playback::Audio(bytes)) => primed.push_back(bytes),
+                Ok(Playback::End) => ended = true,
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err("Reply converter stopped during priming")
+                }
                 Err(RecvTimeoutError::Timeout) => {}
             }
         }
-        if pcm.is_empty() {
-            return Err("No response audio received");
-        }
-        let source_samples = pcm.len() / 2;
-        let preparation = Instant::now();
-        let mut prepared = Vec::new();
-        prepared
-            .try_reserve_exact(pcm.len() + 128)
-            .map_err(|_| "Filtered reply allocation failed")?;
-        let mut filter = espal_core::dsp::Upsampler::new();
-        let mut peak = 0i32;
-        for (index, bytes) in pcm.chunks_exact(2).enumerate() {
-            let sample = i16::from_le_bytes([bytes[0], bytes[1]]);
-            peak = peak.max(i32::from(sample).abs());
-            prepared.extend(filter.push(sample));
-            if index % 480 == 479 {
-                if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
-                    return Err("Playback conversion cancelled");
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-        for _ in 0..63 {
-            prepared.extend(filter.push(0));
-        }
-        queued.fetch_sub(pcm.len(), Ordering::AcqRel);
-        drop(pcm);
         log::info!(
-            "Reply prepared: pcm24_samples={source_samples} conversion_ms={} peak16={peak}",
-            preparation.elapsed().as_millis()
+            "Streaming playback: primed_ms={} wait_ms={}",
+            primed.len() * 20,
+            waiting.elapsed().as_millis()
         );
-        let mut output = vec![0u8; 960 * 8];
-        let mut input = vec![0u8; output.len()];
+        let silence = vec![0u8; 960 * 8];
+        let mut input = vec![0u8; silence.len()];
         self.preload_silence()
             .map_err(|_| "Playback preload failed")?;
         self.driver
@@ -107,24 +192,36 @@ impl Diagnostics {
             return Err("Playback enable failed");
         }
         let started = Instant::now();
-        let mut max_pack_us = 0u128;
+        let mut gaps = 0usize;
+        let mut frames = 0usize;
         let result = (|| {
             let timeout = TickType::new_millis(100).ticks();
-            for samples in prepared.chunks(960) {
+            loop {
                 if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
                     return Err("Playback cancelled");
                 }
-                let packing = Instant::now();
-                output.fill(0);
-                for (sample, frame) in samples.iter().zip(output.chunks_exact_mut(8)) {
-                    let word = ((i32::from(*sample) / SPEAKER_DIVISOR) << 16).to_le_bytes();
-                    frame[..4].copy_from_slice(&word);
-                    frame[4..].copy_from_slice(&word);
-                }
-                max_pack_us = max_pack_us.max(packing.elapsed().as_micros());
+                let next = if let Some(bytes) = primed.pop_front() {
+                    Some(bytes)
+                } else if ended {
+                    break;
+                } else {
+                    match prepared.recv_timeout(Duration::from_millis(10)) {
+                        Ok(Playback::Audio(bytes)) => Some(bytes),
+                        Ok(Playback::End) => break,
+                        Err(RecvTimeoutError::Disconnected) => {
+                            return Err("Reply converter stopped")
+                        }
+                        Err(RecvTimeoutError::Timeout) => {
+                            gaps += 1;
+                            None
+                        }
+                    }
+                };
+                let output = next.as_deref().unwrap_or(&silence);
                 self.driver
-                    .write_all(&output, timeout)
+                    .write_all(output, timeout)
                     .map_err(|_| "Speaker write failed")?;
+                frames += output.len() / 8;
                 let mut captured = 0;
                 while captured < input.len() {
                     let n = self
@@ -137,13 +234,12 @@ impl Diagnostics {
                     captured += n;
                 }
             }
-            output.fill(0);
             for _ in 0..25 {
-                if Instant::now() >= deadline {
-                    return Err("Playback tail deadline exceeded");
+                if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    return Err("Playback tail cancelled");
                 }
                 self.driver
-                    .write_all(&output, timeout)
+                    .write_all(&silence, timeout)
                     .map_err(|_| "Playback silence failed")?;
                 self.driver
                     .read(&mut input, timeout)
@@ -153,7 +249,7 @@ impl Diagnostics {
         })();
         let tx = self.driver.tx_disable();
         let rx = self.driver.rx_disable();
-        log::info!("Playback: pcm24_samples={source_samples} elapsed_ms={} max_20ms_pack_us={max_pack_us} speaker_divisor={SPEAKER_DIVISOR}", started.elapsed().as_millis());
+        log::info!("Playback: frames48={frames} elapsed_ms={} preparation_gaps={gaps} speaker_divisor={SPEAKER_DIVISOR}", started.elapsed().as_millis());
         if tx.is_err() || rx.is_err() {
             return Err("Playback shutdown failed");
         }

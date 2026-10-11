@@ -112,10 +112,11 @@ OpenAI, configures mono 24kHz PCM16 with turn detection disabled, then prints
 filters 48→24kHz with a 63-tap low-pass FIR, sends 100ms base64 PCM chunks,
 commits the turn, and requests a spoken response.
 
-The current speaker diagnostic collects the complete response, limited to twenty
-seconds of PCM, and performs filtered 24→48kHz conversion before starting I2S.
-During playback only sample packing and DMA service run. This increases startup
-latency while isolating processing stalls; continuous streaming is still planned.
+Reply audio is filtered and packed on a separate task while the speaker task
+services DMA. Playback starts after 400ms is prepared (or a shorter reply ends),
+with a bounded two-second prepared queue and a twenty-second raw PCM queue cap.
+This allows speech to begin before the complete reply arrives. Playback logs
+report preparation gaps; filter and DMA tasks preserve sample order.
 Speaker output is attenuated 4× (-12dB), with 80ms of I2S DMA buffering.
 Microphone uploads stay gated during playback and a 500ms acoustic tail. The
 120-second diagnostic turn deadline and bounded packet queues remain enforced. Errors stop
