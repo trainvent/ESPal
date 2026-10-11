@@ -145,6 +145,17 @@ Microphone uploads stay gated during playback and a 500ms acoustic tail. The
 eleven-minute conversation deadline and bounded packet queues remain enforced. Errors stop
 audio and close the socket; automatic reconnect is disabled for bench testing.
 
+Experimental interruption: say **Jarvis** while Cedar is speaking. A local
+16kHz echo canceller receives microphone audio and the attenuated speaker
+reference, aligned with the 80ms DMA preload. WakeNet examines the cleaned
+signal on core 0 while reply conversion runs on core 1; the CPU runs at 240MHz.
+Detection stops playback, cancels unfinished generation, and truncates the
+assistant's conversation item to the portion played. Wait for the ready beep,
+then say your next request. General speech does not trigger interruption yet.
+`aec-check` checks synthetic echo suppression; `interrupt-check` runs twelve
+seconds of quiet local playback with AEC/WakeNet and checks detector reuse.
+Real speech and speaker echo rejection still require physical acceptance tests.
+
 WebSocket callbacks only copy bounded fragments into a queue. JSON assembly
 and parsing happen outside the callback, with a 64KiB message cap and explicit
 support for receive-buffer splits and continuation frames. Server error text is

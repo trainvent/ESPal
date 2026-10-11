@@ -23,14 +23,30 @@ fn check_error(event: &serde_json::Value) -> Result<(), &'static str> {
 /// Quiet local check of the same filters, duplex and playback queue used by
 /// Realtime, without networking or microphone upload.
 pub fn pipeline_test(audio: &mut Diagnostics) -> Result<(), &'static str> {
+    pipeline_duration(audio, 1.2)
+}
+pub fn interruption_test(audio: &mut Diagnostics) -> Result<(), &'static str> {
+    pipeline_duration(audio, 12.0)?;
+    log::info!("Interruption diagnostic complete");
+    Ok(())
+}
+fn pipeline_duration(audio: &mut Diagnostics, seconds: f32) -> Result<(), &'static str> {
+    // Retain an idle detector while the playback detector comes and goes,
+    // exercising the shared ESP-SR model registry used in standalone mode.
+    let mut idle_detector = crate::wake::Detector::new()?;
+    let interruption = crate::interruption::Signals::default();
     let mut down = Downsampler::new(1);
-    let mut pcm = Vec::with_capacity(57600);
-    for index in 0..57600 {
+    let count = (seconds * 48000.0) as usize;
+    let mut pcm = Vec::with_capacity(count);
+    for index in 0..count {
         let t = index as f32 / 48000.0;
-        let envelope = (t / 0.01).min((1.2 - t) / 0.01).clamp(0.0, 1.0);
+        let envelope = (t / 0.01).min((seconds - t) / 0.01).clamp(0.0, 1.0);
         let sample = ((t * 440.0 * std::f32::consts::TAU).sin() * envelope * 327.0) as i32;
         if let Some(v) = down.push_word(sample << 16) {
             pcm.extend_from_slice(&v.to_le_bytes());
+        }
+        if index % 4800 == 0 {
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
     let (sender, receiver) = mpsc::sync_channel(2);
@@ -42,15 +58,25 @@ pub fn pipeline_test(audio: &mut Diagnostics) -> Result<(), &'static str> {
     sender
         .send(Playback::End)
         .map_err(|_| "Pipeline queue failed")?;
-    audio.playback(
+    audio.playback_interruptible(
         receiver,
         &queued,
         &cancel,
-        Instant::now() + Duration::from_secs(5),
+        Instant::now() + Duration::from_secs(30),
+        Some(&interruption),
     )?;
     if queued.load(Ordering::Acquire) != 0 {
         return Err("Pipeline did not drain");
     }
+    if interruption.detected.load(Ordering::Acquire) {
+        return Err("Playback tone falsely triggered Jarvis");
+    }
+    for _ in 0..2048 {
+        if idle_detector.push(0)? {
+            return Err("Idle wake detector falsely triggered after playback");
+        }
+    }
+    idle_detector.reset()?;
     log::info!("Filtered pipeline test complete: 48→24→48kHz, queue drained");
     Ok(())
 }
@@ -320,7 +346,7 @@ pub fn capture_reply(audio: &mut Diagnostics, config: &Config) -> Result<Vec<u8>
 
 pub fn turn(audio: &mut Diagnostics, config: &Config) -> Result<(), &'static str> {
     let (mut socket, deadline) = request(audio, config)?;
-    play_response(audio, &mut socket, deadline)
+    play_response(audio, &mut socket, deadline).map(|_| ())
 }
 
 pub fn ready_chime(audio: &mut Diagnostics) -> Result<(), &'static str> {
@@ -364,7 +390,10 @@ pub fn session(audio: &mut Diagnostics, config: &Config) -> Result<(), &'static 
         input?;
         socket.send(&json!({"type":"input_audio_buffer.commit"}))?;
         socket.send(&json!({"type":"response.create"}))?;
-        play_response(audio, &mut socket, deadline)?;
+        if play_response(audio, &mut socket, deadline)? {
+            ready_chime(audio)?;
+            log::info!("Interruption accepted; speak after the beep");
+        }
     }
     Ok(())
 }
@@ -373,7 +402,7 @@ fn play_response(
     audio: &mut Diagnostics,
     socket: &mut Socket,
     deadline: Instant,
-) -> Result<(), &'static str> {
+) -> Result<bool, &'static str> {
     log::info!("Waiting for spoken response; microphone upload gated");
     // Generation can outrun the speaker for an entire long answer. Budget the
     // pending PCM against currently available PSRAM, after the wake model and
@@ -395,20 +424,41 @@ fn play_response(
     let cancel = AtomicBool::new(false);
     let mut received_bytes = 0usize;
     let mut max_queued = 0usize;
+    let interruption = crate::interruption::Signals::default();
+    let mut response_done = false;
+    let mut item_id: Option<String> = None;
+    let mut content_index = 0usize;
     let result = std::thread::scope(|scope| {
         let queued_ref = &queued;
         let cancel_ref = &cancel;
+        let interruption_ref = &interruption;
         let worker = std::thread::Builder::new()
             .name("speaker".into())
             .stack_size(8192)
             .spawn_scoped(scope, move || {
-                audio.playback(receiver, queued_ref, cancel_ref, deadline)
+                audio.playback_interruptible(
+                    receiver,
+                    queued_ref,
+                    cancel_ref,
+                    deadline,
+                    Some(interruption_ref),
+                )
             })
             .map_err(|_| "Speaker task failed")?;
         let stream = (|| loop {
-            let event = socket.receive(deadline)?;
+            let event = socket.receive_interruptible(deadline, Some(&interruption.detected))?;
             check_error(&event)?;
             if let Some(bytes) = realtime::audio_delta(&event)? {
+                item_id = Some(
+                    event["item_id"]
+                        .as_str()
+                        .ok_or("Response audio item missing")?
+                        .to_owned(),
+                );
+                content_index = event["content_index"]
+                    .as_u64()
+                    .ok_or("Response audio content index missing")?
+                    as usize;
                 if worker.is_finished() {
                     return Err("Speaker stopped before response completion");
                 }
@@ -427,6 +477,7 @@ fn play_response(
                 }
             }
             if event["type"] == "response.done" {
+                response_done = true;
                 if event["response"]["status"] != "completed" {
                     return Err("OpenAI response did not complete");
                 }
@@ -436,16 +487,61 @@ fn play_response(
                 return Ok(());
             }
         })();
-        if stream.is_err() {
+        if stream.is_err() && !interruption.detected.load(Ordering::Acquire) {
             cancel.store(true, Ordering::Release);
             let _ = socket.send(&json!({"type":"response.cancel"}));
         }
         drop(sender);
         let played = worker.join().map_err(|_| "Speaker task panicked")?;
-        stream.and(played)
+        if interruption.detected.load(Ordering::Acquire) {
+            let item_id = item_id
+                .as_deref()
+                .ok_or("Interrupted response item unavailable")?;
+            if !response_done {
+                socket.send(
+                    &json!({"type":"response.cancel", "event_id":"espal_interrupt_cancel"}),
+                )?;
+            }
+            let played_ms = interruption
+                .played_ms
+                .load(Ordering::Acquire)
+                .min(received_bytes / 48);
+            socket.send(
+                &json!({"type":"conversation.item.truncate", "item_id":item_id,
+                               "content_index":content_index, "audio_end_ms":played_ms}),
+            )?;
+            // Drain cancelled audio and acknowledgement before the next turn.
+            let cleanup_deadline = deadline.min(Instant::now() + Duration::from_secs(10));
+            let mut truncated = false;
+            while !response_done || !truncated {
+                let event = socket.receive(cleanup_deadline)?;
+                // Generation may finish between detecting the wake word and
+                // cancelling it. A cancel error is harmless only when it is
+                // attributable to our own event and a terminal response.done
+                // still arrives; all other server errors remain fatal.
+                if event["type"] == "error"
+                    && event["error"]["event_id"] == "espal_interrupt_cancel"
+                {
+                    continue;
+                }
+                check_error(&event)?;
+                if event["type"] == "response.done" {
+                    response_done = true;
+                }
+                if event["type"] == "conversation.item.truncated" && event["item_id"] == item_id {
+                    truncated = true;
+                }
+            }
+            log::info!(
+                "Reply interrupted: played_ms={played_ms}; unplayed audio removed from history"
+            );
+            Ok(true)
+        } else {
+            stream.and(played).map(|_| false)
+        }
     });
     log::info!("Response audio: received_bytes={received_bytes} max_queued_bytes={max_queued}");
-    if result.is_ok() {
+    if matches!(result, Ok(false)) {
         log::info!("Turn finished; audio stopped");
     }
     result

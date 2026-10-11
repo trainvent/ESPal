@@ -16,6 +16,10 @@ opt-level = "s"
 debug = true
 opt-level = "z"
 
+# FIR loops run concurrently with AEC and WakeNet during speaker playback.
+[profile.dev.package.espal-core]
+opt-level = 3
+
 [dependencies]
 log = "0.4"
 esp-idf-svc = "=0.53.0"

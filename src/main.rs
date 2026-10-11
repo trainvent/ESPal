@@ -2,6 +2,7 @@ mod audio;
 mod config;
 mod conversation;
 mod duplex;
+mod interruption;
 mod network;
 mod standalone;
 mod wake;
@@ -180,7 +181,7 @@ fn main() {
                                     let (i2s,pins)=hardware.take().ok_or("Reset before the isolated tone test")?;
                                     audio::Diagnostics::tone_tx(i2s,pins,command=="tone-pico").map_err(|e|{log::error!("TX-only tone driver error: {e}");"TX-only tone failed; reset before further audio use"})?;
                                 },
-                                "stats" | "tone" | "record" | "pipeline" | "loopback" | "input-test" | "wake-check" | "wake-test"=>{
+                                "stats" | "tone" | "record" | "pipeline" | "loopback" | "input-test" | "wake-check" | "wake-test" | "aec-check" | "interrupt-check"=>{
                                     if audio.is_none() {
                                         let (i2s,pins)=hardware.take().ok_or("Audio initialization requires restart")?;
                                         audio=Some(audio::Diagnostics::new(i2s,pins).map_err(|_|"Audio initialization failed")?);
@@ -201,6 +202,10 @@ fn main() {
                                             conversation::ready_chime(driver)?;
                                         }
                                         log::info!("Wake diagnostic complete");
+                                    } else if command=="interrupt-check" {
+                                        conversation::interruption_test(driver)?;
+                                    } else if command=="aec-check" {
+                                        interruption::check()?;
                                     } else if command=="input-test" {
                                         conversation::input_test(driver)?;
                                     } else if command=="loopback" {

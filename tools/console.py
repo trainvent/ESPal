@@ -7,7 +7,7 @@ import serial
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["help", "stats", "tone", "tone16", "tone-pico", "pipeline", "loopback", "input-test", "wake-check", "wake-test", "standalone", "connect", "check", "turn", "forget", "voice"])
+    parser.add_argument("command", choices=["help", "stats", "tone", "tone16", "tone-pico", "pipeline", "loopback", "input-test", "wake-check", "wake-test", "aec-check", "interrupt-check", "standalone", "connect", "check", "turn", "forget", "voice"])
     parser.add_argument("voice", nargs="?", choices=["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar", "on", "off"])
     parser.add_argument("--port", default="/dev/ttyACM0")
     args = parser.parse_args()
@@ -37,7 +37,13 @@ def main():
             line = port.readline(4096)
             if line:
                 print(line.decode("utf-8", "replace").strip(), flush=True)
+                if args.command == "turn" and b"Reply interrupted:" in line:
+                    return
                 if args.command == "standalone" and line.strip() == f"ESPAL_STANDALONE {args.voice}".encode():
+                    return
+                if args.command == "interrupt-check" and b"Interruption diagnostic complete" in line:
+                    return
+                if args.command == "aec-check" and b"AEC diagnostic complete" in line:
                     return
                 if args.command in ("wake-check", "wake-test") and b"Wake diagnostic complete" in line:
                     return

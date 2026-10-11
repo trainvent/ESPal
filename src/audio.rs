@@ -44,6 +44,17 @@ impl Diagnostics {
         cancel: &AtomicBool,
         deadline: Instant,
     ) -> Result<(), &'static str> {
+        self.playback_interruptible(receiver, queued, cancel, deadline, None)
+    }
+
+    pub fn playback_interruptible(
+        &mut self,
+        receiver: Receiver<Playback>,
+        queued: &AtomicUsize,
+        cancel: &AtomicBool,
+        deadline: Instant,
+        interruption: Option<&crate::interruption::Signals>,
+    ) -> Result<(), &'static str> {
         // Conversion runs independently of DMA servicing. Bound the prepared
         // queue to two seconds, and prime 600ms before starting the clocks.
         // Keep the FIR worker away from the Wi-Fi task pinned to core 0.
@@ -62,6 +73,48 @@ impl Diagnostics {
         .set()
         .map_err(|_| "Reply filter scheduling configuration failed")?;
         std::thread::scope(|scope| {
+            let (monitor_sender, monitor_receiver) = std::sync::mpsc::sync_channel(20);
+            let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
+            let monitor = if let Some(signals) = interruption {
+                // Split AEC/WakeNet and reconstruction across the two cores.
+                // Wi-Fi shares core 0, so the detector yields regularly.
+                ThreadSpawnConfiguration {
+                    pin_to_core: Some(Core::Core0),
+                    ..ThreadSpawnConfiguration::default()
+                }
+                .set()
+                .map_err(|_| "Interruption scheduling configuration failed")?;
+                Some(
+                    std::thread::Builder::new()
+                        .name("echo-wake".into())
+                        .stack_size(16384)
+                        .spawn_scoped(scope, move || {
+                            crate::interruption::run(
+                                monitor_receiver,
+                                signals,
+                                cancel,
+                                ready_sender,
+                            )
+                        })
+                        .map_err(|_| "Interruption task failed")?,
+                )
+            } else {
+                None
+            };
+            ThreadSpawnConfiguration {
+                pin_to_core: Some(Core::Core1),
+                ..ThreadSpawnConfiguration::default()
+            }
+            .set()
+            .map_err(|_| "Reply filter scheduling configuration failed")?;
+            let monitor_sender = if monitor.is_some() {
+                ready_receiver
+                    .recv()
+                    .map_err(|_| "Interruption initialization task stopped")??;
+                Some(monitor_sender)
+            } else {
+                None
+            };
             let (sender, prepared) = std::sync::mpsc::sync_channel(100);
             let converter = std::thread::Builder::new()
                 .name("reply-filter".into())
@@ -152,13 +205,26 @@ impl Diagnostics {
                     Ok((samples, peak, max_conversion_us))
                 })
                 .map_err(|_| "Reply filter task failed")?;
-            let played = self.play_prepared(&prepared, cancel, deadline);
+            let played = self.play_prepared(
+                &prepared,
+                cancel,
+                deadline,
+                monitor_sender.as_ref(),
+                interruption,
+            );
             if played.is_err() {
                 cancel.store(true, Ordering::Release);
             }
             // Unblock a converter waiting on a full queue after DMA failure.
             drop(prepared);
+            drop(monitor_sender);
+            let monitored = if let Some(worker) = monitor {
+                worker.join().map_err(|_| "Interruption task panicked")?
+            } else {
+                Ok(())
+            };
             let converted = converter.join().map_err(|_| "Reply filter task panicked")?;
+            monitored?;
             match (played, converted) {
                 (Err(e), _) => Err(e),
                 (_, Err(e)) => Err(e),
@@ -175,6 +241,8 @@ impl Diagnostics {
         prepared: &Receiver<Playback>,
         cancel: &AtomicBool,
         deadline: Instant,
+        monitor: Option<&std::sync::mpsc::SyncSender<crate::interruption::Frame>>,
+        interruption: Option<&crate::interruption::Signals>,
     ) -> Result<(), &'static str> {
         let waiting = Instant::now();
         let mut primed = std::collections::VecDeque::new();
@@ -199,6 +267,11 @@ impl Diagnostics {
         );
         let silence = vec![0u8; 960 * 8];
         let mut input = vec![0u8; silence.len()];
+        // The first 80ms played by TX is the preloaded silence, not the first
+        // block passed to write_all. Delay the digital reference by that exact
+        // number of samples so AEC sees the audio actually reaching the speaker.
+        let mut reference_delay =
+            std::collections::VecDeque::from(vec![0i32; FRAMES * DMA_BUFFERS]);
         self.preload_silence()
             .map_err(|_| "Playback preload failed")?;
         self.driver
@@ -211,6 +284,7 @@ impl Diagnostics {
         let started = Instant::now();
         let mut gaps = 0usize;
         let mut frames = 0usize;
+        let mut audio_frames = 0usize;
         let result = (|| {
             let timeout = TickType::new_millis(100).ticks();
             loop {
@@ -249,6 +323,39 @@ impl Diagnostics {
                         return Err("Empty gated capture");
                     }
                     captured += n;
+                }
+                if next.is_some() {
+                    audio_frames += output.len() / 8;
+                }
+                if let Some(signals) = interruption {
+                    // The DMA starts with 80ms of preloaded silence. Exclude
+                    // queued but not yet audible output when truncating history.
+                    signals.played_ms.store(
+                        audio_frames.saturating_sub(FRAMES * DMA_BUFFERS) / 48,
+                        Ordering::Release,
+                    );
+                }
+                if let Some(monitor) = monitor {
+                    reference_delay.extend(
+                        output
+                            .chunks_exact(8)
+                            .map(|f| i32::from_le_bytes(f[..4].try_into().unwrap())),
+                    );
+                    let frame = crate::interruption::Frame {
+                        captured_at: Instant::now(),
+                        microphone: input
+                            .chunks_exact(8)
+                            .map(|f| i32::from_le_bytes(f[..4].try_into().unwrap()))
+                            .collect(),
+                        reference: (0..input.len() / 8)
+                            .map(|_| reference_delay.pop_front().unwrap())
+                            .collect(),
+                    };
+                    // Missing microphone/reference frames invalidate AEC timing.
+                    // Stop explicitly rather than silently losing synchronization.
+                    if monitor.try_send(frame).is_err() {
+                        return Err("Echo cancellation fell behind playback");
+                    }
                 }
             }
             for _ in 0..25 {

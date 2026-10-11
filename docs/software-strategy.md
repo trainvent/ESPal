@@ -80,6 +80,24 @@ Host tests should focus on PCM/DSP, event parsing/fragment assembly and state tr
 
 ## Current status
 
+Experimental playback interruption now uses ESP-SR 2.0.5 standalone AEC at
+16kHz with 512-sample frames, feeding cleaned microphone audio into Jarvis
+WakeNet. The post-volume speaker reference is delayed by the 80ms TX DMA
+preload. Detection stops DMA, cancels unfinished response generation, and
+truncates the assistant item to the played duration before another ready beep.
+Wake-model flash mappings are shared for the firmware lifetime because the
+library caches a global registry. AEC/WakeNet runs on core 0; reconstruction
+runs on core 1, with CPU frequency set to 240MHz. Microphone audio during
+playback stays local. Natural speech interruption is not enabled yet.
+
+On-device synthetic 10ms echo-delay testing measured 19.8dB suppression.
+Twelve seconds of quiet playback with simultaneous AEC/WakeNet completed with
+zero preparation gaps, no false wake trigger, and 44ms maximum processing
+backlog in the final run, with no watchdog warnings. Both detector instances
+remained reusable. Live overlapping speech,
+echo rejection at normal speaker volume, and API cancellation/truncation still
+need user acceptance testing.
+
 USB, microphone recording, Wi-Fi/SNTP, certificate-validated OpenAI sessions,
 and clean physical speaker playback are verified. Both input and output now
 stream through bounded queues. TX-first duplex initialization made the speaker

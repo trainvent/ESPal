@@ -1,6 +1,21 @@
 //! Owned offline WakeNet instance. Idle microphone audio stays on the Nano.
 use esp_idf_svc::sys::*;
 
+// ESP-SR 2.0.5 caches one global model registry. Multiple independent WakeNet
+// instances must share it; deinitializing one would invalidate all the others.
+// Keep this small flash mapping for the firmware lifetime, serialized at init.
+static MODELS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+fn models() -> Result<*mut srmodel_list_t, &'static str> {
+    let mut address = MODELS.lock().map_err(|_| "Wake registry lock failed")?;
+    if *address == 0 {
+        *address = unsafe { esp_srmodel_init(c"model".as_ptr()) } as usize;
+    }
+    if *address == 0 {
+        return Err("Wake models unavailable");
+    }
+    Ok(*address as *mut srmodel_list_t)
+}
+
 pub struct Detector {
     models: *mut srmodel_list_t,
     iface: *const esp_wn_iface_t,
@@ -22,7 +37,7 @@ impl Detector {
             used: false,
         };
         unsafe {
-            detector.models = esp_srmodel_init(c"model".as_ptr());
+            detector.models = models()?;
             if detector.models.is_null() {
                 return Err("Wake models unavailable");
             }
@@ -98,9 +113,6 @@ impl Drop for Detector {
                 if let Some(destroy) = (*self.iface).destroy {
                     destroy(self.data);
                 }
-            }
-            if !self.models.is_null() {
-                esp_srmodel_deinit(self.models);
             }
         }
     }

@@ -196,7 +196,17 @@ impl Socket {
         Ok(())
     }
     pub fn receive(&mut self, deadline: Instant) -> Result<serde_json::Value, &'static str> {
+        self.receive_interruptible(deadline, None)
+    }
+    pub fn receive_interruptible(
+        &mut self,
+        deadline: Instant,
+        interrupted: Option<&AtomicBool>,
+    ) -> Result<serde_json::Value, &'static str> {
         loop {
+            if interrupted.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                return Err("Playback interrupted");
+            }
             if self.context.failed.load(Ordering::Acquire) {
                 return Err(if self.context.overflowed.load(Ordering::Acquire) {
                     "WebSocket fragment queue overflow (256 fragments)"
