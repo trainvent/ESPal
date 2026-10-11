@@ -7,7 +7,7 @@ import serial
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["help", "stats", "tone", "tone16", "pipeline", "connect", "check", "turn", "forget"])
+    parser.add_argument("command", choices=["help", "stats", "tone", "tone16", "tone-pico", "pipeline", "loopback", "connect", "check", "turn", "forget"])
     parser.add_argument("--port", default="/dev/ttyACM0")
     args = parser.parse_args()
     port = serial.Serial()
@@ -24,7 +24,7 @@ def main():
             input("Press Enter when ready. Speak when LISTENING appears: ")
         port.write((args.command + "\n").encode())
         port.flush()
-        deadline = time.monotonic() + (120 if args.command == "turn" else 40)
+        deadline = time.monotonic() + (180 if args.command == "turn" else 40)
         while time.monotonic() < deadline:
             line = port.readline(4096)
             if line:
@@ -33,7 +33,11 @@ def main():
                     return
                 if b"espal:" in line and b"E (" in line:
                     return
+                if args.command == "tone-pico" and b"Pico-equivalent 32-bit TX tone complete;" in line:
+                    return
                 if args.command == "tone16" and b"16-bit TX-only tone complete;" in line:
+                    return
+                if args.command == "loopback" and b"I2S loopback complete;" in line:
                     return
                 if args.command == "pipeline" and b"Filtered pipeline test complete:" in line:
                     return

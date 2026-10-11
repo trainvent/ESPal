@@ -80,24 +80,27 @@ Host tests should focus on PCM/DSP, event parsing/fragment assembly and state tr
 
 ## Current status
 
-Hardware bring-up is verified: ESP32-S3 revision v0.2, 16MB flash, DIO at 40MHz,
+USB/firmware/microphone bring-up is verified; speaker acceptance remains open.
+The board is ESP32-S3 revision v0.2, with 16MB flash, DIO at 40MHz,
 and 8MB octal PSRAM at 40MHz with a successful boot memory test. Firmware boots
 idle and responds to USB diagnostics. Microphone tests captured 48,000 samples
-per second without read timeouts or near clipping. User confirmed the quiet
-speaker beep and recognizable recorded speech in VLC; VS Code playback was the
+per second without read timeouts or near clipping. User initially heard the beep, but later isolated tone tests are still distorted.
+Recognizable microphone speech in VLC is confirmed; VS Code playback was the
 original recording issue. Both 1.5s and 5s PCM24 exports passed exact-length and
 FNV-1a checks; yielding during export fixed an initial watchdog warning.
 
 Rust now implements filtered PCM conversion (63-tap FIR, 48→24kHz PCM16 and
 24→48kHz playback), bounded fragmented Realtime messages, local NVS provisioning,
 Wi-Fi/DHCP/SNTP, certificate-validated TLS/WebSocket transport and a manual
-five-second spoken turn. Eight host tests pass. The final networking build was
+five-second spoken turn. Nine host tests pass. The final networking build was
 flashed and its USB commands verified. The on-device quiet filtered pipeline
 test passed (48→24→48kHz), including complete playback queue draining.
 Live Wi-Fi/DHCP/SNTP, TLS certificate validation, OpenAI authentication and
 24kHz session configuration passed on 2026-10-09 using locally provisioned
 credentials. The `check` command performs this verification without microphone
-capture/upload. A spoken request and audible API response remain to verify.
+capture/upload. Spoken requests produce complete responses after queue fixes,
+and the exported received-response WAV sounds clear in VLC. Physical speaker
+playback remains distorted and is not accepted.
 The current bench turn captures before uploading 100ms chunks; continuous input
 queues, multi-turn VAD sessions, capped reconnect backoff, DMA overrun/underrun
 telemetry and TLS-load memory/stack measurements remain outstanding.
@@ -164,3 +167,56 @@ in VLC. Remaining distortion is therefore downstream of decoded incoming PCM.
 Local zero-PCM (`stats`) and quiet-tone tests are requested to distinguish
 playback processing from I2S wiring/amplifier/power behavior. No hardware cause
 has yet been established.
+
+2026-10-11 resumed bring-up: the interrupted flash was completed. The runtime
+format-switch diagnostic was replaced by direct, standalone 16-bit TX-only
+initialization. On-device `tone16` completes without driver errors; listening
+confirmation is pending. The user reports zero-PCM `stats` is silent, the previous
+32-bit duplex tone is distorted, amplifier wiring matches the documented pinout,
+and the amplifier is MAX98357A. Current build and all nine host tests pass.
+
+Listening result: standalone 16-bit TX tone was quiet but still somewhat
+distorted. This does not prove a hardware fault, but rules out OpenAI/network/
+resampling as the sole cause. Speaker impedance/power rating, amplifier supply
+and wiring lengths are being checked before further playback changes.
+
+Internal I2S loopback added and verified on 2026-10-11: D5/GPIO8 TX is routed
+through the GPIO input matrix into I2S0 RX for a bounded low-amplitude signed
+stereo pattern, then microphone D4/GPIO7 routing is restored. The live result
+was 20,157 matched frames, zero invalid frames and zero silence frames after
+data began. This verifies the tested local 32-bit TX/RX packing, sign and channel
+sequence; it does not measure signal integrity at the external amplifier, analog
+speaker output, or playback under Wi-Fi load. Hardware ratings/supply/wiring
+checks remain pending. Command: `python3 tools/console.py loopback`.
+
+Pico comparison (2026-10-11): `/home/leonmarq/Code/pi_ai_rpipico` uses 48kHz,
+32-bit MSB-first I2S slots, signed PCM16 shifted left 16, and an integer 1kHz
+triangle with peak512. `tone-pico` reproduces those samples using a precomputed
+DMA block. The user confirmed this tone is clean; its 1.7-second stream completed
+in 1699ms. Earlier on-the-fly sine tests are not sufficient evidence of a hardware
+fault. As a diagnostic, speech playback now collects a complete bounded reply
+(max ten seconds), prepares FIR-interpolated mono PCM48 before starting I2S,
+and packs signed stereo words during DMA service without live FIR work. This
+adds response startup latency and is an isolation step, not acceptance of the
+planned continuous streaming architecture. Offline pipeline verification passes:
+204ms preparation for 200ms PCM, 2315us maximum packing per 20ms block, 720ms
+playback plus silence/tail, queue fully drained. Live speech listening is pending.
+
+The first prepared-speech run did not reach playback: the response grew to
+499,200 PCM bytes and tripped the initial ten-second cap. Diagnostic capacity
+is now 960,000 bytes/twenty seconds with 512 packet slots; mono prepared PCM48
+uses at most about 1.92MB plus the received PCM buffer, within the 8MB PSRAM
+budget subject to allocation checks. The diagnostic API deadline is 120 seconds
+and the USB turn monitor waits up to 180 seconds. These temporary bench limits
+allow preparation and complete playback; a lower-latency streaming design still
+remains outstanding. Live clean-speech acceptance is still pending.
+
+Prepared speech still sounded distorted. Source inspection revealed HAL 0.47.0
+initializes RX before TX; ESP-IDF 5.5.5 assigns the second channel the duplex
+slave role. A small owned ESP-IDF wrapper (`src/duplex.rs`) now initializes TX
+first, preserving identical shared 48kHz/32-bit Philips framing. Device channel
+info confirms TX master (0), RX slave (1), BCLK 3,072,000Hz. Signed stereo
+loopback passes with 20,160 matched frames, zero invalid frames and zero gaps.
+This tests the clock-ownership difference from the clean standalone tone; it
+does not yet prove clean speech. Microphone RX remains enabled for capture and
+serviced during playback; no wiring change is requested for this test.

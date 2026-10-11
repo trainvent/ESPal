@@ -8,7 +8,7 @@ in [the software strategy](docs/software-strategy.md); connections are in
 
 The current application boots idle and accepts USB commands. It does not
 initialize audio until requested, and starts Wi-Fi only on `connect`, `check` or `turn`, and OpenAI on `check` or `turn`.
-Initial device checks passed: idle boot and USB commands, 48,000 microphone samples per second with no read timeouts, and a clear quiet beep confirmed by the user. User confirmed recognizable speech in VLC; VS Code playback was the original listening issue. The selected sample alignment is supported by that recording.
+Initial device checks passed: idle boot and USB commands, 48,000 microphone samples per second with no read timeouts, and an audible beep initially confirmed by the user. Later isolated tone tests are distorted, so speaker playback remains unresolved. User confirmed recognizable speech in VLC; VS Code playback was the original listening issue. The selected sample alignment is supported by that recording.
 
 - `help`: display the command descriptions.
 - `stats`: run shared-clock duplex I2S for one second, transmitting silence,
@@ -81,7 +81,7 @@ espflash board-info --port /dev/ttyACM0 --before no-reset --after no-reset --ski
 The integration is implemented, host-tested and flashed. The offline filtered
 playback pipeline passes on the Nano. Live Wi-Fi, DHCP, synchronized time,
 TLS certificate validation, OpenAI authentication and session configuration
-were verified on 2026-10-09. A spoken request and speaker reply remain to verify.
+were verified on 2026-10-09. Received reply PCM is clear in a VLC-tested WAV; physical speaker output remains distorted.
 
 ```sh
 python3 tools/provision.py
@@ -108,13 +108,14 @@ OpenAI, configures mono 24kHz PCM16 with turn detection disabled, then prints
 filters 48→24kHz with a 63-tap low-pass FIR, sends 100ms base64 PCM chunks,
 commits the turn, and requests a spoken response.
 
-The response runs through a bounded speaker task: 100ms priming, a ten-second
-PCM limit, filtered 24→48kHz interpolation, and mono duplicated into both I2S
-slots. Speaker output is attenuated 16× (-24dB) for bench testing, with 80ms
-of I2S DMA buffering. Microphone uploads stay gated during playback and a 500ms acoustic tail.
-A 60-second deadline bounds the API turn. Overflow/disconnect/error cancels the
-response, stops audio and closes the socket. Automatic reconnect is disabled
-for this first bench version, so authentication errors cannot cause a retry storm.
+The current speaker diagnostic collects the complete response, limited to twenty
+seconds of PCM, and performs filtered 24→48kHz conversion before starting I2S.
+During playback only sample packing and DMA service run. This increases startup
+latency while isolating processing stalls; continuous streaming is still planned.
+Speaker output is attenuated 16× (-24dB), with 80ms of I2S DMA buffering.
+Microphone uploads stay gated during playback and a 500ms acoustic tail. The
+120-second diagnostic turn deadline and bounded packet queues remain enforced. Errors stop
+audio and close the socket; automatic reconnect is disabled for bench testing.
 
 WebSocket callbacks only copy bounded fragments into a queue. JSON assembly
 and parsing happen outside the callback, with a 64KiB message cap and explicit
@@ -152,3 +153,10 @@ and credential header/URL injection rejection. `Cargo.lock` and
 4. Exercise Wi-Fi loss, slow playback, cancellation and repeated-turn failures.
 
 Never commit credentials or upload microphone audio automatically at boot.
+
+For speaker troubleshooting, `python3 tools/console.py loopback` verifies a
+brief low-level signed stereo pattern through the internal GPIO input matrix.
+It restores the microphone routing and never uploads microphone audio. This
+checks digital sample transport, not external amplifier wiring or analog output.
+`tone16` initializes a separate 16-bit TX-only path; reset before another audio
+command in the same USB session after this isolated test.

@@ -1,6 +1,7 @@
 mod audio;
 mod config;
 mod conversation;
+mod duplex;
 mod network;
 mod websocket;
 
@@ -96,17 +97,19 @@ fn main() {
                                         } else { conversation::turn(audio.as_mut().unwrap(),c)?; }
                                     }
                                 },
-                                "tone16"=>{
+                                "tone16" | "tone-pico"=>{
                                     let (i2s,pins)=hardware.take().ok_or("Reset before the isolated tone test")?;
-                                    audio::Diagnostics::tone16(i2s,pins).map_err(|e|{log::error!("16-bit tone driver error: {e}");"16-bit tone failed; reset before further audio use"})?;
+                                    audio::Diagnostics::tone_tx(i2s,pins,command=="tone-pico").map_err(|e|{log::error!("TX-only tone driver error: {e}");"TX-only tone failed; reset before further audio use"})?;
                                 },
-                                "stats" | "tone" | "record" | "pipeline"=>{
+                                "stats" | "tone" | "record" | "pipeline" | "loopback"=>{
                                     if audio.is_none() {
                                         let (i2s,pins)=hardware.take().ok_or("Audio initialization requires restart")?;
                                         audio=Some(audio::Diagnostics::new(i2s,pins).map_err(|_|"Audio initialization failed")?);
                                     }
                                     let driver=audio.as_mut().unwrap();
-                                    if command=="pipeline" {
+                                    if command=="loopback" {
+                                        driver.loopback()?;
+                                    } else if command=="pipeline" {
                                         conversation::pipeline_test(driver)?;
                                     } else if command=="record" {
                                         log::info!("Recording 5 seconds now; speaker silent");

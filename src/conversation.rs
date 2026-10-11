@@ -79,7 +79,7 @@ pub fn check(config: &Config) -> Result<(), &'static str> {
 }
 
 fn request(audio: &mut Diagnostics, config: &Config) -> Result<(Socket, Instant), &'static str> {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(120);
     let mut socket = open_session(config, deadline)?;
     log::info!("LISTENING: speak now for five seconds");
     let raw = audio.record().map_err(|_| "Microphone capture failed")?;
@@ -135,7 +135,7 @@ pub fn capture_reply(audio: &mut Diagnostics, config: &Config) -> Result<Vec<u8>
 pub fn turn(audio: &mut Diagnostics, config: &Config) -> Result<(), &'static str> {
     let (mut socket, deadline) = request(audio, config)?;
     log::info!("Waiting for spoken response; microphone upload gated");
-    let (sender, receiver) = mpsc::sync_channel(256);
+    let (sender, receiver) = mpsc::sync_channel(512);
     let queued = AtomicUsize::new(0);
     let cancel = AtomicBool::new(false);
     let mut received_bytes = 0usize;
@@ -159,11 +159,11 @@ pub fn turn(audio: &mut Diagnostics, config: &Config) -> Result<(), &'static str
                         return Err("Speaker stopped before response completion");
                     }
                     // Allow response-generation bursts ahead of real-time playback.
-                    // Ten seconds of PCM (480KB) remains bounded and fits PSRAM.
+                    // Twenty seconds of PCM (960KB) remains bounded and fits PSRAM.
                     received_bytes += bytes.len();
                     let previous = queued.fetch_add(bytes.len(), Ordering::AcqRel);
                     max_queued = max_queued.max(previous + bytes.len());
-                    if previous + bytes.len() > 480000 {
+                    if previous + bytes.len() > 960000 {
                         return Err("Playback overflow; response cancelled");
                     }
                     sender
