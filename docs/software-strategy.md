@@ -279,3 +279,19 @@ An injected upload error stopped capture after 141ms; a subsequent one-second
 silence/capture diagnostic returned 48,000 samples with no read timeouts,
 confirming channel reuse. Firmware builds and ten core tests pass. Live network
 input latency and speech recognition remain to be verified by the user.
+
+The user's live input-streaming turn captured five seconds in 4,998ms and
+drained upload 1,689ms later, reducing the prior 7.16-second post-capture wait.
+All 240,000 input bytes arrived with zero clipping; raw/PCM buffer peaks were
+1,300/200ms. The 21.2-second response completed, but playback inserted ten
+20ms silence blocks while waiting for prepared audio, matching small audible
+inconsistencies. Maximum conversion batch time was 36,289 microseconds.
+
+Playback tuning now pins only the reply FIR worker to CPU core 1, separate
+from the configured Wi-Fi task on core 0. Thread-spawn configuration is restored
+after playback. Initial prepared buffering increases from 400ms to 600ms;
+short replies still start after their end marker. Queue caps and amplitude
+remain unchanged. The flashed local pipeline verifies Core1 placement,
+600ms priming in 404ms, zero preparation gaps, 1.720-second playback including
+the tail, and complete queue drain. Build and diff checks pass. Smoothing under
+live Wi-Fi/OpenAI load still requires the user's longer-reply listening test.

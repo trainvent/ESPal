@@ -19,7 +19,8 @@ const RATE: u32 = 48_000;
 const FRAMES: usize = 240;
 // 80ms of hardware buffering covers the measured Wi-Fi scheduling stalls.
 const DMA_BUFFERS: usize = 16;
-// User-selected speaker level: -12dB relative to received PCM.
+const PLAYBACK_PRIME_BLOCKS: usize = 30; // 600ms of prepared audio.
+                                         // User-selected speaker level: -12dB relative to received PCM.
 const SPEAKER_DIVISOR: i32 = 4;
 
 pub struct Diagnostics {
@@ -44,13 +45,29 @@ impl Diagnostics {
         deadline: Instant,
     ) -> Result<(), &'static str> {
         // Conversion runs independently of DMA servicing. Bound the prepared
-        // queue to two seconds, and prime 400ms before starting the clocks.
+        // queue to two seconds, and prime 600ms before starting the clocks.
+        // Keep the FIR worker away from the Wi-Fi task pinned to core 0.
+        use esp_idf_svc::hal::{cpu::Core, task::thread::ThreadSpawnConfiguration};
+        struct RestoreSpawnConfig(ThreadSpawnConfiguration);
+        impl Drop for RestoreSpawnConfig {
+            fn drop(&mut self) {
+                let _ = self.0.set();
+            }
+        }
+        let _spawn_config = RestoreSpawnConfig(ThreadSpawnConfiguration::get().unwrap_or_default());
+        ThreadSpawnConfiguration {
+            pin_to_core: Some(Core::Core1),
+            ..ThreadSpawnConfiguration::default()
+        }
+        .set()
+        .map_err(|_| "Reply filter scheduling configuration failed")?;
         std::thread::scope(|scope| {
             let (sender, prepared) = std::sync::mpsc::sync_channel(100);
             let converter = std::thread::Builder::new()
                 .name("reply-filter".into())
                 .stack_size(8192)
                 .spawn_scoped(scope, move || {
+                    log::info!("Reply filter: core={:?}", esp_idf_svc::hal::cpu::core());
                     let mut filter = espal_core::dsp::Upsampler::new();
                     let mut output = Vec::with_capacity(960 * 8);
                     let mut samples = 0usize;
@@ -162,7 +179,7 @@ impl Diagnostics {
         let waiting = Instant::now();
         let mut primed = std::collections::VecDeque::new();
         let mut ended = false;
-        while primed.len() < 20 && !ended {
+        while primed.len() < PLAYBACK_PRIME_BLOCKS && !ended {
             if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
                 return Err("Playback priming cancelled");
             }

@@ -118,7 +118,8 @@ drain. An overflow or upload failure cancels input and closes the session.
 `Input streaming:` logs capture time, total time, buffer peaks and clipping.
 
 Reply audio is filtered and packed on a separate task while the speaker task
-services DMA. Playback starts after 400ms is prepared (or a shorter reply ends),
+services DMA. The conversion task is pinned to core 1, separate from Wi-Fi
+on core 0. Playback starts after 600ms is prepared (or a shorter reply ends),
 with a bounded two-second prepared queue and a twenty-second raw PCM queue cap.
 This allows speech to begin before the complete reply arrives. Playback logs
 report preparation gaps; filter and DMA tasks preserve sample order.
