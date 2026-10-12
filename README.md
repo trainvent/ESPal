@@ -1,63 +1,82 @@
 # ESPal
 
-Standalone Nano ESP32 voice assistant. Architecture and acceptance criteria are
-in [the software strategy](docs/software-strategy.md); connections are in
-[the pinout](docs/pinout.md).
+**A standalone voice assistant for the Arduino Nano ESP32, built in Rust.**
 
-## Initial firmware
+![ESP32-S3](https://img.shields.io/badge/ESP32--S3-Nano_ESP32-red)
+![Rust](https://img.shields.io/badge/Firmware-Rust-orange)
+![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v5.5.5-blue)
+![OpenAI Realtime](https://img.shields.io/badge/AI-OpenAI_Realtime-412991)
+[![License: GPL v3](https://img.shields.io/badge/License-GPL_v3-blue)](LICENSE.md)
 
-The application supports USB bench commands and a saved standalone mode.
-`python3 tools/console.py standalone on` enables offline Jarvis listening after
-a five-second USB recovery window at boot. Say **Jarvis**, wait for the ready
-beep, then speak naturally. A 1.2-second pause ends the request; follow-up
-questions use the same OpenAI session. After 15 seconds without a new question,
-the Nano returns to offline wake listening. Idle wake audio stays on the Nano.
-Cedar remains the reply voice. Continuous input has a ten-minute limit, and
-each conversation has an eleven-minute deadline.
+Say **Jarvis**, wait for the ready beep, and ask a question. ESPal streams your
+voice directly to OpenAI over Wi-Fi and plays the spoken response through an
+I2S speaker. The Nano handles audio, networking, and conversation control;
+a computer is only needed for setup and diagnostics.
 
-`python3 tools/console.py standalone off` restores bench mode. Opening the
-console resets the board; send this command within the five-second boot window.
-The offline wake model uses ESP-SR 2.0.5 in a separate model partition; the flash
-helper packs and writes it without changing NVS/PHY offsets. Boot and speech
-acceptance for standalone mode are recorded in the software strategy.
+> **Development status:** microphone recording and clear speaker speech have
+> been verified on the Nano. Standalone wake listening and streaming conversations
+> are implemented. Wake-word interruption during playback is experimental and
+> still needs physical speech and echo-rejection acceptance tests.
 
-Microphone recording and clean speaker speech are verified. TX-first duplex
-initialization fixed speaker distortion. Both input and reply audio now stream
-through bounded queues, with Cedar voice and 4× speaker attenuation.
+[Features](#-key-features) · [Hardware](#-hardware--wiring) ·
+[Quick start](#-quick-start) · [Commands](#-usb-commands) ·
+[Troubleshooting](#-troubleshooting) · [Development](#-development)
 
-- `help`: display the command descriptions.
-- `stats`: run shared-clock duplex I2S for one second, transmitting silence,
-  and log left-slot microphone sample count, peak, RMS, near-clipping and read
-  timeouts. The signed 24-bit alignment is supported by the recognizable speech recording.
-- `tone`: run the same diagnostic with a 200 ms, 440 Hz tone at 1% digital full
-  scale and a 10 ms envelope. Actual speaker loudness depends on the amplifier.
-- `record`: capture 5 seconds (240,000 samples) of native mono PCM24 with silent
-  output, stop both channels, then export bounded hexadecimal chunks and an
-  FNV-1a checksum over USB. Requires 720KB of available contiguous capture memory;
-  allocation or capture failure aborts the recording.
+## ✨ Key features
 
-Commands end with Enter. The command buffer is capped at 2048 bytes (including provisioning JSON). Both I2S
-channels stop after each diagnostic, including an error. DMA overrun/underrun
-telemetry remains to be implemented.
+- **Local wake word:** ESP-SR detects “Jarvis” on the Nano. Idle wake audio stays on the device.
+- **Streaming conversations:** microphone capture, filtering, upload, and reply playback use separate tasks and bounded queues.
+- **Follow-up questions:** keep talking in the same OpenAI session; 15 seconds of inactivity returns to wake listening.
+- **Natural speech endings:** a 1.2-second pause ends a request, with a ready beep before listening.
+- **Configurable replies:** choose the Realtime model, voice, instructions, and microphone gain over USB.
+- **Secure transport:** certificate and hostname validation, with SNTP time synchronization before TLS.
+- **Local diagnostics:** test the microphone, speaker, audio pipeline, wake detector, and echo cancellation from USB.
+- **Experimental interruption:** say “Jarvis” during a reply to stop playback and begin another request.
 
-To record speech, run this locally, press Enter when ready, then speak immediately:
+## 🔌 Hardware & wiring
 
-```sh
-python3 tools/record.py
-```
+### Required components
 
-The tool requires `pyserial`, verifies the exact length and checksum before
-writing a mono PCM24 WAV, and defaults to
-`/home/leonmarq/Dokumente/Codex/ESPal/microphone-speech-5s.wav`. Choose a different
-filename with `--output` for subsequent recordings; it refuses to overwrite.
-The WAV applies 16× listening gain by default and reports clipped samples. Use
-`--gain 1` for unmodified native samples, or a lower gain if speech clips.
-No resampling is applied. USB port access is required.
+| Component | ESPal setup |
+| --- | --- |
+| Controller | Arduino Nano ESP32 / ESP32-S3, 16MB flash and 8MB octal PSRAM |
+| Microphone | ICS-43434 I2S microphone |
+| Amplifier | MAX98357A I2S amplifier |
+| Output | Passive speaker; confirm impedance and power rating for your amplifier |
+| Power & setup | USB cable with data support and a suitable USB supply |
+| Network | 2.4GHz Wi-Fi and an OpenAI project API key with Realtime access |
 
-Build dependencies are locked in `Cargo.lock`. The initial stack uses
-`esp-idf-svc` 0.53.0 and ESP-IDF v5.5.5. The development toolchain installed for
-bring-up is Espressif Rust 1.97.0.0, with espup 0.18.0, espflash 4.6.0 and
-ldproxy 0.3.5.
+### Connections
+
+The microphone and amplifier share the I2S clock lines.
+
+| Nano printed pin | ESP32 GPIO | ICS-43434 | MAX98357A |
+| --- | --- | --- | --- |
+| D2 | GPIO5 | BCLK / SCK | BCLK |
+| D3 | GPIO6 | WS / LRCL | LRC |
+| D4 | GPIO7 | DOUT / SD | — |
+| D5 | GPIO8 | — | DIN |
+| 3V3 | — | VDD / 3V | — |
+| VBUS | — | — | VIN |
+| GND | — | GND and SEL / L-R | GND |
+
+Connect the speaker across **SPK+ and SPK−**, never from a speaker output to GND.
+Mic SEL/L-R to GND selects the left slot. Microphone power and GPIO signals are
+**3.3V**; VBUS supplies approximately **5V** while USB powered. Rust uses ESP32
+GPIO numbers, not Arduino digital pin numbers.
+
+See [the full pinout](docs/pinout.md) for a wiring diagram, module details,
+and hardware references.
+
+## 🚀 Quick start
+
+The commands below use the Linux development setup and `/dev/ttyACM0`.
+Run them from the repository root; substitute your board's actual serial port.
+
+### 1. Install the development tools
+
+You need Rust/Cargo, Python 3, and the ESP-IDF host build prerequisites.
+The bring-up toolchain uses these pinned versions:
 
 ```sh
 cargo +stable install espup --version 0.18.0 --locked
@@ -65,150 +84,254 @@ cargo +stable install espflash --version 4.6.0 --locked
 cargo +stable install ldproxy --version 0.3.5 --locked
 espup install --std --targets esp32s3 --toolchain-version 1.97.0.0 --export-file ./export-esp.sh
 . ./export-esp.sh
+
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install pyserial
+```
+
+Source `export-esp.sh` in every new build terminal and activate `.venv` before
+using the Python tools. The first build downloads ESP-IDF and managed tools
+into `.embuild/`.
+
+### 2. Build and flash
+
+```sh
 cargo build --locked
+bash tools/flash.sh
 ```
 
-The first build downloads ESP-IDF and its managed tools into `.embuild/`.
-Realtime I2S, wake detection and echo cancellation live in `crates/espal-audio`,
-compiled for speed independently of the session/upload firmware. Keep these
-profile settings: whole-firmware speed optimization caused a reproducible
-microphone-upload crash on the current Xtensa toolchain.
-Run `. ./export-esp.sh` in every new terminal before building.
+Always use `tools/flash.sh` (also the `cargo run` runner). It writes the offline
+wake model, selects the matching ESP-IDF bootloader, and uses `partitions.csv`
+with a 3MiB factory application partition. NVS and PHY offsets remain unchanged.
+The generated default ESP-IDF partition table is not used.
 
-## USB bring-up
-
-On Linux, the account needs access to the Nano's serial device. A temporary
-grant, using the actual enumerated port, is:
+For another port:
 
 ```sh
-sudo setfacl -m u:"$(id -un)":rw /dev/ttyACM0
+ESPFLASH_PORT=/dev/ttyACM1 bash tools/flash.sh
 ```
 
-USB re-enumeration may remove this grant. For firmware download mode, connect
-**B1 to GND**, press **RST** once, then remove the B1–GND connection.
-This is the [Arduino download-mode procedure](https://support.arduino.cc/hc/en-us/articles/9810414060188-Reset-the-Arduino-bootloader-on-the-Nano-ESP32).
-Then inspect the board before writing:
+If USB access or download mode fails, see [troubleshooting](#-troubleshooting).
 
-```sh
-espflash board-info --port /dev/ttyACM0 --before no-reset --after no-reset --skip-update-check
-```
-
-`cargo build --locked` has passed for this scaffold. Flashing and boot are verified on the Nano: 16MB flash, DIO at 40MHz. The Nano’s 8MB octal PSRAM is enabled at 40MHz and passed the boot memory test. Do not treat a build as an audio test.
-
-## Wi-Fi and first OpenAI turn
-
-The integration is implemented, host-tested and flashed. The offline filtered
-playback pipeline passes on the Nano. Live Wi-Fi, DHCP, synchronized time,
-TLS certificate validation, OpenAI authentication and session configuration
-were verified on 2026-10-09. Received reply PCM is clear in a VLC-tested WAV; the user confirmed clean physical speaker speech after initializing TX as duplex clock master.
+### 3. Provision Wi-Fi and OpenAI
 
 ```sh
 python3 tools/provision.py
 python3 tools/console.py connect
 python3 tools/console.py check
+```
+
+The setup tool prompts locally for Wi-Fi credentials, a dedicated OpenAI project
+key, model, voice, instructions, and microphone gain. Password and key entry are
+hidden; settings are saved atomically as one NVS blob without creating a secret file.
+
+The tool currently suggests `gpt-realtime-2.1` and `marin`; model access depends
+on your project. The tested device uses **Cedar**, which you can select during
+setup or save afterward:
+
+```sh
+python3 tools/console.py voice cedar
+```
+
+`connect` checks Wi-Fi, DHCP, and synchronized time. `check` verifies OpenAI
+authentication and audio-session configuration without capturing or uploading
+microphone audio.
+
+### 4. Try a conversation
+
+```sh
 python3 tools/console.py turn
 ```
 
-Change the saved voice without re-entering credentials using
-`python3 tools/console.py voice cedar` (or another supported Realtime voice).
-The voice applies to subsequent turns and persists across restarts.
+Press Enter when ready, then speak when `LISTENING` appears. Pause to finish
+your request, listen to the reply, and ask a follow-up question.
 
-The setup tool prompts locally for a 2.4GHz Wi-Fi SSID/password and a dedicated
-OpenAI project key. Password/key entry is hidden. A validated config is saved
-atomically as one NVS blob; no secret file is created. Ordinary NVS does not
-protect credentials against physical extraction. `forget` removes the blob.
-
-Model, voice, instructions and microphone gain are provisioned settings. The
-initial model is `gpt-realtime-2.1` from the current official examples; actual
-project access must be checked. Microphone gain starts at 1 because the raw
-recording played correctly in VLC. Keep credentials out of chat and source.
-
-`connect` establishes Wi-Fi, DHCP and SNTP. TLS is not attempted without time
-synchronization. `check` verifies OpenAI authentication and audio session configuration
-without capturing or uploading microphone audio. `turn` opens a certificate/hostname-validated WebSocket to
-OpenAI, configures mono 24kHz PCM16 with turn detection disabled, then prints
-`LISTENING`. Speak naturally until finished. Separate tasks capture the
-microphone, filter 48→24kHz with a 63-tap low-pass FIR, and upload 100ms base64
-PCM chunks while you speak. Two bounded queues each hold up to two seconds
-between stages. Upload temporarily uses the same priority as the audio workers;
-its original priority is restored afterward. The turn is committed only after
-all emitted native samples become the matching number of uploaded PCM bytes and both queues
-drain. An overflow or upload failure cancels input and closes the session.
-`Input streaming:` logs capture time, total time, buffer peaks and clipping.
-
-Reply audio is filtered and packed on a separate task while the speaker task
-services DMA. The conversion task is pinned to core 1, separate from Wi-Fi
-on core 0. Playback starts after 600ms is prepared (or a shorter reply ends),
-with a bounded two-second prepared queue. The raw PCM queue holds up to sixty
-seconds (2.88MB), reduced automatically if necessary to leave 2MiB of free PSRAM
-for prepared audio and networking. `Reply buffer:` reports the actual capacity.
-This allows speech to begin before the complete reply arrives. Playback logs
-report preparation gaps; filter and DMA tasks preserve sample order.
-Speaker output is attenuated 4× (-12dB), with 80ms of I2S DMA buffering.
-Microphone uploads stay gated during playback and a 500ms acoustic tail. The
-eleven-minute conversation deadline and bounded packet queues remain enforced. Errors stop
-audio and close the socket; automatic reconnect is disabled for bench testing.
-
-Experimental interruption: say **Jarvis** while Cedar is speaking. A local
-16kHz echo canceller receives microphone audio and the attenuated speaker
-reference, aligned with the 80ms DMA preload. WakeNet examines the cleaned
-signal on core 0 while reply conversion runs on core 1; the CPU runs at 240MHz.
-Detection stops playback, cancels unfinished generation, and truncates the
-assistant's conversation item to the portion played. Wait for the ready beep,
-then say your next request. General speech does not trigger interruption yet.
-`aec-check` checks synthetic echo suppression; `interrupt-check` runs twelve
-seconds of quiet local playback with AEC/WakeNet and checks detector reuse.
-`interrupt-network-check` repeats that test with Wi-Fi/TLS connected, then plays
-an OpenAI reply to a fixed text prompt. It does not upload microphone audio.
-Audio blocks larger than 1KiB and TLS allocations prefer PSRAM, with 64KiB
-reserved for internal-only allocations. The echo task checks remaining internal
-memory before playback starts. Network receive and speaker tasks run at audio
-priority so echo processing cannot starve them.
-Real speech and speaker echo rejection still require physical acceptance tests.
-
-WebSocket callbacks only copy bounded fragments into a queue. JSON assembly
-and parsing happen outside the callback, with a 64KiB message cap and explicit
-support for receive-buffer splits and continuation frames. Server error text is
-not logged; HTTP authentication/access/quota errors are redacted descriptions.
-
-An optional `pipeline` command plays a brief quiet tone through the same
-48→24→48kHz filters and bounded playback path without any network request.
-`input-test` captures locally with a deliberately slow consumer, then injects
-an upload failure and verifies the capture driver remains usable. It neither
-uploads microphone audio nor plays it through the speaker.
-
-## Build, flash and test
+### 5. Enable standalone mode
 
 ```sh
+python3 tools/console.py standalone on
+```
+
+The setting persists across restarts. After a five-second USB recovery window
+at boot, the Nano starts offline wake listening:
+
+1. Say **Jarvis**.
+2. Wait for the ready beep.
+3. Speak naturally; a 1.2-second pause ends the request.
+4. Listen, then ask another question in the same session.
+5. After 15 seconds without a new question, ESPal returns to wake listening.
+
+Continuous input is limited to ten minutes, and each conversation has an
+eleven-minute deadline.
+
+To return to USB bench mode:
+
+```sh
+python3 tools/console.py standalone off
+```
+
+Opening the console resets the board. Send the command during the five-second
+boot recovery window.
+
+## 🛠 USB commands
+
+Use `python3 tools/console.py COMMAND`, adding `--port /dev/ttyACM1` if needed.
+
+| Command | Purpose |
+| --- | --- |
+| `help` | Display firmware command descriptions |
+| `connect` | Connect Wi-Fi and synchronize time |
+| `check` | Validate OpenAI authentication and session setup; no microphone upload |
+| `turn` | Start a speech-ended conversation |
+| `voice cedar` | Save the reply voice for subsequent turns |
+| `standalone on` / `standalone off` | Save the boot mode |
+| `forget` | Remove the saved configuration blob |
+| `stats` | One second of microphone statistics with silent output |
+| `tone` | Brief, low-amplitude 440Hz tone through duplex I2S |
+| `pipeline` | Local tone through the filtered playback pipeline; no network request |
+| `loopback` | Check digital I2S sample transport and restore microphone routing |
+| `input-test` | Stress input queues and cancellation locally; no microphone upload |
+| `wake-check` / `wake-test` | Wake detector self-check / live detection test |
+| `aec-check` | Synthetic echo-suppression diagnostic |
+| `interrupt-check` | Local playback with AEC/WakeNet and detector-reuse checks |
+| `interrupt-network-check` | Check interruption with Wi-Fi/TLS and a fixed-text OpenAI reply; no microphone upload |
+
+For an isolated 16-bit speaker test, use `tone16`; reset before another audio
+command in that USB session. `tone-pico` plays a precomputed comparison tone.
+Loopback checks digital transport, not amplifier wiring or analog output.
+
+### Record the microphone locally
+
+```sh
+python3 tools/record.py
+```
+
+Press Enter when ready and speak immediately. The tool captures five seconds
+of native 48kHz mono PCM24, verifies length and checksum, and writes a WAV.
+It refuses to overwrite an existing file. Default listening gain is 16×;
+use `--gain 1` for native samples or lower gain if speech clips. Without
+`--output`, recordings go to `/home/leonmarq/Dokumente/Codex/ESPal/microphone-speech-5s.wav`.
+Recording requires 720KB of contiguous capture memory and aborts on failure.
+
+## ⚙️ How it works
+
+1. **Wake:** the Nano listens locally for “Jarvis” and plays a ready beep.
+2. **Capture:** the ICS-43434 microphone sends your speech to the Nano over I2S.
+3. **Request:** the Nano filters and streams audio to OpenAI Realtime over Wi-Fi and TLS.
+4. **Reply:** OpenAI streams response audio back to the Nano.
+5. **Playback:** the Nano sends processed audio to the MAX98357A amplifier and speaker.
+
+| Stage | Implementation |
+| --- | --- |
+| Hardware audio | Shared-clock 48kHz Philips I2S, two 32-bit slots; TX initializes first as clock master |
+| Microphone upload | Left-slot PCM24 → 63-tap low-pass FIR → mono 24kHz PCM16, uploaded in 100ms chunks |
+| Input buffering | Separate capture/filter/upload stages; two queues, each bounded to two seconds |
+| Reply playback | Filtered 24→48kHz conversion on core 1; mono duplicated into stereo slots |
+| Playback buffering | 600ms initial preparation, two-second prepared queue, up to sixty seconds of raw reply PCM subject to PSRAM availability |
+| Speaker level | 4× digital attenuation (−12dB), with 80ms I2S DMA buffering |
+| Interruption | Local 16kHz echo cancellation and WakeNet on core 0; detected wake cancels playback and truncates conversation history to audio played |
+
+Microphone uploads are gated during normal reply playback and a 500ms acoustic
+tail. General speech does not yet trigger interruption. Errors stop audio and
+close the socket; automatic reconnect is disabled for bench testing.
+
+WebSocket callbacks copy bounded fragments into a queue; assembly and JSON
+parsing happen outside the callback, with a 64KiB message limit and support for
+split receive buffers and continuation frames. Input is committed only after
+sample/byte counts match and both input queues drain. Overflow or upload failure
+cancels the input rather than committing incomplete audio.
+
+For architecture decisions and recorded hardware acceptance results, see
+[the software strategy](docs/software-strategy.md).
+
+## 🔍 Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| Serial permission denied | Confirm the actual port and grant your Linux account access; USB re-enumeration may remove a temporary grant |
+| Board will not flash | Enter download mode using B1 and RST, then inspect the board before retrying |
+| Wi-Fi connection fails | Check the saved SSID/password and use a 2.4GHz network |
+| TLS connection fails | Run `connect`; TLS requires synchronized time |
+| OpenAI authentication or access fails | Check the project key, model access, and quota; run `check` before an audio turn |
+| No microphone audio | Check D4/GPIO7, shared clocks, 3.3V power, and SEL/L-R to GND; run `stats` and record a WAV |
+| Speaker audio is distorted | Check amplifier power, common ground, and wiring; use `tone-pico` and `loopback` to isolate the path |
+| Reply has audible gaps | Inspect `Playback` preparation-gap logs and `Reply buffer` capacity under live network load |
+| Standalone starts before a USB command | Use the five-second recovery window after the console resets the board |
+
+Temporary Linux serial access:
+
+```sh
+sudo setfacl -m u:"$(id -un)":rw /dev/ttyACM0
+```
+
+For download mode, connect **B1 to GND**, press **RST** once, then remove the
+B1–GND connection. Inspect the board before writing:
+
+```sh
+espflash board-info --port /dev/ttyACM0 --before no-reset --after no-reset --skip-update-check
+```
+
+## 🔐 Credentials & audio privacy
+
+- Idle wake detection runs locally; idle wake audio stays on the Nano.
+- Active requests send microphone audio directly to OpenAI over validated TLS.
+- Provision credentials locally over USB; keep keys out of source, logs, and chat.
+- Ordinary NVS does not protect credentials against physical extraction.
+- `forget` removes the saved configuration blob.
+- Standalone mode must be explicitly enabled; boot then starts local wake listening.
+
+## 🧑‍💻 Development
+
+### Project structure
+
+```text
+ESPal/
+├── src/                      # Configuration, networking, sessions, standalone mode
+├── crates/
+│   ├── espal-audio/          # I2S, wake detection, echo cancellation, playback
+│   └── espal-core/           # DSP, speech detection, protocol, configuration checks
+├── tools/                    # USB setup, console, recording, and flash helpers
+├── docs/
+│   ├── pinout.md             # Wiring and hardware references
+│   └── software-strategy.md  # Architecture and hardware acceptance history
+├── partitions.csv            # Flash layout, including wake-model partition
+├── sdkconfig.defaults        # ESP-IDF configuration
+├── Cargo.toml                # Firmware dependencies and build profiles
+└── LICENSE.md                # GNU GPL v3
+```
+
+### Build and host tests
+
+```sh
+. ./export-esp.sh
 cargo build --locked
-bash tools/flash.sh
 cargo +stable test --manifest-path crates/espal-core/Cargo.toml --target x86_64-unknown-linux-gnu --locked
 ```
 
-Always flash through `tools/flash.sh` (also the `cargo run` runner). It selects
-the matching built ESP-IDF bootloader and the repository's `partitions.csv`,
-which gives the factory app 3MiB; the old 1MiB diagnostic partition is too small
-for Wi-Fi/TLS. NVS and PHY offsets stay the same. ESP-IDF's generated default
-partition artifact is not used by the flash helper.
-
-Host tests cover PCM alignment/gain/saturation, exact chunk counts and filter
+`Cargo.lock` and `components_esp32s3.lock` pin the Rust and managed-component
+builds. Host tests cover PCM alignment/gain/saturation, sample counts and filter
 continuity, alias/image rejection, fragmented message limits, PCM event decoding,
-and credential header/URL injection rejection. `Cargo.lock` and
-`components_esp32s3.lock` pin the Rust and managed-component builds.
+and credential header/URL injection rejection.
 
-## Remaining milestones
+Keep the per-crate speed optimization settings in `Cargo.toml`: whole-firmware
+speed optimization caused a reproducible microphone-upload crash on the current
+Xtensa toolchain. A successful build or host test does not establish physical
+audio quality; verify relevant changes on the Nano.
 
-1. Verify a spoken API response and clear speaker playback (Wi-Fi/SNTP/TLS and account session access pass).
-2. Add DMA overrun/underrun telemetry and measure memory/stack use under TLS load.
-3. Replace the initial capture-then-upload bench turn with continuously serviced
-   bounded input queues, then add finite multi-turn sessions and VAD.
-4. Exercise Wi-Fi loss, slow playback, cancellation and repeated-turn failures.
+### Remaining work
 
-Never commit credentials or upload microphone audio automatically at boot.
+- Complete real-speech interruption and speaker echo-rejection acceptance tests.
+- Add DMA overrun/underrun telemetry and measure memory/stack use under TLS load.
+- Exercise Wi-Fi loss, slow playback, cancellation, and repeated-turn failures.
+- Measure longer conversations and playback gaps under live network load.
 
-For speaker troubleshooting, `python3 tools/console.py loopback` verifies a
-brief low-level signed stereo pattern through the internal GPIO input matrix.
-It restores the microphone routing and never uploads microphone audio. This
-checks digital sample transport, not external amplifier wiring or analog output.
-`tone16` initializes a separate 16-bit TX-only path; reset before another audio
-command in the same USB session after this isolated test.
+## 📄 License
+
+See [LICENSE.md](LICENSE.md) for the GNU General Public License, version 3.
+
+## Acknowledgments
+
+Built with the esp-rs ecosystem, Espressif ESP-IDF and ESP-SR, and OpenAI Realtime.
+README presentation inspired by
+[Ingeimaks's ESP32 AI Voice Assistant](https://github.com/Ingeimaks/ESP32-AI-Voice-Assistant).
