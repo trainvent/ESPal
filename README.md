@@ -22,7 +22,7 @@ a computer is only needed for setup and diagnostics.
 [Quick start](#-quick-start) · [Commands](#-usb-commands) ·
 [Troubleshooting](#-troubleshooting) · [Development](#-development)
 
-## ✨ Key features
+## Key features
 
 - **Local wake word:** ESP-SR detects “Jarvis” on the Nano. Idle wake audio stays on the device.
 - **Streaming conversations:** microphone capture, filtering, upload, and reply playback use separate tasks and bounded queues.
