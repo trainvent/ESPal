@@ -1,5 +1,5 @@
 use esp_idf_svc::{hal::delay::TickType, sys::*};
-use espal_core::realtime::Assembler;
+use espal_core::{realtime::Assembler, recovery::handshake_error as connection_error};
 use std::{
     ffi::CString,
     sync::{
@@ -24,16 +24,6 @@ struct Context {
     sender: SyncSender<Incoming>,
     failed: AtomicBool,
     overflowed: AtomicBool,
-}
-
-fn connection_error(status: i32) -> &'static str {
-    match status {
-        401 => "OpenAI authentication failed (401); re-provision the API key",
-        403 => "OpenAI access denied (403); check project/model access",
-        400 => "OpenAI handshake rejected (400); check configured Realtime model",
-        429 => "OpenAI rate or quota limit (429); no automatic retry",
-        _ => "TLS/WebSocket connection failed or disconnected",
-    }
 }
 
 // ESP-IDF owns callback execution. `Context` remains pinned until stop/destroy

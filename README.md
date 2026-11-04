@@ -138,6 +138,14 @@ python3 tools/console.py voice cedar
 authentication and audio-session configuration without capturing or uploading
 microphone audio.
 
+To switch to Wi-Fi profile 1 from the local `.env` while keeping the saved API
+key and other settings:
+
+```sh
+python3 tools/provision.py --wifi-profile 1
+python3 tools/console.py connect
+```
+
 ### 4. Try a conversation
 
 ```sh
@@ -161,6 +169,20 @@ at boot, the Nano starts offline wake listening:
 3. Speak naturally; a 1.2-second pause ends the request.
 4. Listen, then ask another question in the same session.
 5. After 15 seconds without a new question, ESPal returns to wake listening.
+
+A short error notification signals a connection or conversation failure.
+Wi-Fi rejection events end an attempt immediately; otherwise association and
+DHCP share an eight-second timeout.
+In standalone mode, temporary connection failures trigger up to three retries
+after 1, 2, and 4 seconds. Quiet waiting ticks start when Jarvis is detected and
+continue during retry waits and Wi-Fi/time connection. The error clip plays
+only if recovery gives up.
+A ready beep means you can speak again; repeat your question after a dropped connection. Failed audio
+is discarded and each reconnect starts a fresh conversation. Exhausted retries,
+authentication, quota, configuration, and local audio errors return to wake
+listening. Say Jarvis to try again. USB commands remain single-attempt diagnostics.
+Preview the notification with `python3 tools/console.py failure-sound`.
+Preview the retry ticks with `python3 tools/console.py waiting-sound`.
 
 Continuous input is limited to ten minutes, and each conversation has an
 eleven-minute deadline.
@@ -234,7 +256,8 @@ Recording requires 720KB of contiguous capture memory and aborts on failure.
 
 Microphone uploads are gated during normal reply playback and a 500ms acoustic
 tail. General speech does not yet trigger interruption. Errors stop audio and
-close the socket; automatic reconnect is disabled for bench testing.
+close the socket. Standalone mode retries temporary connection failures with
+bounded backoff; USB diagnostics do not reconnect automatically.
 
 WebSocket callbacks copy bounded fragments into a queue; assembly and JSON
 parsing happen outside the callback, with a 64KiB message limit and support for

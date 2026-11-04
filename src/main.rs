@@ -132,6 +132,17 @@ fn main() {
                             }
                             Err(e) => log::error!("Provisioning failed: {e}"),
                         }
+                    } else if let Some(json) = command.strip_prefix("wifi ") {
+                        match store.set_wifi(json) {
+                            Ok(c) => {
+                                if let Some(n) = network.as_mut() {
+                                    network::Network::stop(n);
+                                }
+                                config = Some(c);
+                                println!("ESPAL_WIFI_SAVED");
+                            }
+                            Err(e) => log::error!("Wi-Fi setting failed: {e}"),
+                        }
                     } else if let Some(mode) = command.strip_prefix("standalone ") {
                         match mode {
                             "on" | "off" => match store.set_standalone(mode == "on") {
@@ -180,13 +191,19 @@ fn main() {
                                     let (i2s,pins)=hardware.take().ok_or("Reset before the isolated tone test")?;
                                     audio::Diagnostics::tone_tx(i2s,pins,command=="tone-pico").map_err(|e|{log::error!("TX-only tone driver error: {e}");"TX-only tone failed; reset before further audio use"})?;
                                 },
-                                "stats" | "tone" | "record" | "pipeline" | "loopback" | "input-test" | "wake-check" | "wake-test" | "aec-check" | "interrupt-check"=>{
+                                "stats" | "tone" | "failure-sound" | "waiting-sound" | "record" | "pipeline" | "loopback" | "input-test" | "wake-check" | "wake-test" | "aec-check" | "interrupt-check"=>{
                                     if audio.is_none() {
                                         let (i2s,pins)=hardware.take().ok_or("Audio initialization requires restart")?;
                                         audio=Some(audio::Diagnostics::new(i2s,pins).map_err(|_|"Audio initialization failed")?);
                                     }
                                     let driver=audio.as_mut().unwrap();
-                                    if command=="wake-check" || command=="wake-test" {
+                                    if command=="waiting-sound" {
+                                        conversation::retry_waiting_chime(driver)?;
+                                        log::info!("Retry waiting sound complete");
+                                    } else if command=="failure-sound" {
+                                        conversation::connection_failure_chime(driver)?;
+                                        log::info!("Connection failure sound complete");
+                                    } else if command=="wake-check" || command=="wake-test" {
                                         let mut detector=wake::Detector::new()?;
                                         if command=="wake-check" {
                                             for _ in 0..2 {

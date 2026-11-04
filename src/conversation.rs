@@ -49,7 +49,7 @@ impl Drop for AudioPriority {
 fn check_error(event: &serde_json::Value) -> Result<(), &'static str> {
     // Do not log server error text: it can include user data or credentials.
     if event["type"] == "error" {
-        return Err("OpenAI returned an error; check model access, key and limits");
+        return Err(espal_core::recovery::server_error(&event["error"]));
     }
     Ok(())
 }
@@ -441,6 +441,38 @@ pub fn ready_chime(audio: &mut Diagnostics) -> Result<(), &'static str> {
         let sample = ((ramp as i32 - 6) * 1600 / 6) as i16;
         pcm.extend_from_slice(&sample.to_le_bytes());
     }
+    play_chime(audio, pcm)
+}
+
+pub fn connection_failure_chime(audio: &mut Diagnostics) -> Result<(), &'static str> {
+    let mut pcm = include_bytes!("../assets/connection-error.pcm").to_vec();
+    for sample in pcm.chunks_exact_mut(2) {
+        let quieter = i16::from_le_bytes([sample[0], sample[1]]) / 2;
+        sample.copy_from_slice(&quieter.to_le_bytes());
+    }
+    play_chime(audio, pcm)
+}
+
+pub fn retry_waiting_chime(audio: &mut Diagnostics) -> Result<(), &'static str> {
+    // Two quiet, steady ticks distinguish retry waiting from the ready beep.
+    let mut pcm = Vec::with_capacity(9600);
+    for index in 0..4800 {
+        let tick = index % 3360;
+        let sample = if tick < 1440 {
+            let envelope = (tick as f32 / 240.0)
+                .min((1439 - tick) as f32 / 240.0)
+                .min(1.0);
+            let phase = std::f32::consts::TAU * 600.0 * tick as f32 / 24000.0;
+            (phase.sin() * 1400.0 * envelope) as i16
+        } else {
+            0
+        };
+        pcm.extend_from_slice(&sample.to_le_bytes());
+    }
+    play_chime(audio, pcm)
+}
+
+fn play_chime(audio: &mut Diagnostics, pcm: Vec<u8>) -> Result<(), &'static str> {
     let (sender, receiver) = mpsc::sync_channel(2);
     let queued = AtomicUsize::new(pcm.len());
     let cancel = AtomicBool::new(false);
@@ -458,10 +490,15 @@ pub fn ready_chime(audio: &mut Diagnostics) -> Result<(), &'static str> {
     )
 }
 
-pub fn session(audio: &mut Diagnostics, config: &Config) -> Result<(), &'static str> {
+pub fn session(
+    audio: &mut Diagnostics,
+    config: &Config,
+    on_ready: impl FnOnce(),
+) -> Result<(), &'static str> {
     let deadline = Instant::now() + Duration::from_secs(660);
-    let mut socket = open_session(config, deadline)?;
+    let mut socket = open_session(config, Instant::now() + Duration::from_secs(25))?;
     ready_chime(audio)?;
+    on_ready();
     log::info!("Conversation ready; speak after the beep");
     while Instant::now() < deadline {
         let input = stream_input(audio, config.mic_gain, true, deadline, &mut |chunk| {
@@ -572,6 +609,11 @@ fn play_response(
             if event["type"] == "response.done" {
                 response_done = true;
                 if event["response"]["status"] != "completed" {
+                    if event["response"]["status"] == "failed" {
+                        return Err(espal_core::recovery::server_error(
+                            &event["response"]["status_details"]["error"],
+                        ));
+                    }
                     return Err("OpenAI response did not complete");
                 }
                 sender

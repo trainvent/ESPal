@@ -42,6 +42,30 @@ impl Store {
         self.nvs.remove("config").map_err(|_| "NVS erase failed")?;
         Ok(())
     }
+    pub fn set_wifi(&self, json: &str) -> Result<Config, &'static str> {
+        let wifi: serde_json::Value =
+            serde_json::from_str(json).map_err(|_| "Invalid Wi-Fi JSON")?;
+        let mut config = self.load()?.ok_or("Provision credentials first")?;
+        config.ssid = wifi
+            .get("ssid")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("Missing SSID")?
+            .into();
+        config.password = wifi
+            .get("password")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("Missing password")?
+            .into();
+        config.validate()?;
+        let mut bytes = serde_json::to_vec(&config).map_err(|_| "Config encoding failed")?;
+        let result = self
+            .nvs
+            .set_blob("config", &bytes)
+            .map_err(|_| "NVS write failed");
+        bytes.fill(0);
+        result?;
+        Ok(config)
+    }
     pub fn set_voice(&self, voice: &str) -> Result<Config, &'static str> {
         let mut config = self.load()?.ok_or("Provision credentials first")?;
         config.voice = voice.into();
